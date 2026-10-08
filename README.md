@@ -17,6 +17,14 @@ AI Auto Video Editor là ứng dụng React/Vite + Express phục vụ quy trìn
 
 GitHub Actions chạy kiểm tra TypeScript, build, FFmpeg và HTTP API. Endpoint `GET /api/health` trả thông tin trạng thái cấu hình không nhạy cảm.
 
+## Cải tiến dựa trên nghiên cứu thực nghiệm (2026-10-08)
+- Ghi chép nguồn tham khảo, nguyên lý chọn lọc, giới hạn và các lựa chọn không áp dụng tại [docs/RESEARCH.md](docs/RESEARCH.md).
+- **Cắt khoảng lặng có bảo vệ lời nói:** giữ khoảng đệm 0,18 giây sau lời nói và 0,25 giây trước lời nói tiếp theo; không tự cắt đoạn quá ngắn.
+- **Phân tích bằng chứng hình ảnh:** FFmpeg ước lượng mốc chuyển cảnh trong tối đa 90 giây đầu và đưa dữ liệu thực đo vào ngữ cảnh Gemini; không diễn giải các cảnh chưa quan sát.
+- **Kiểm tra dữ liệu:** xử lý khoảng lặng ở cuối video, từ chối audio-only, sửa giá trị NaN và từ chối kế hoạch AI sai cấu trúc.
+- **Minh bạch:** khi thời lượng video sau cắt vẫn dài hơn mục tiêu, chế độ cơ bản báo rõ thay vì tự ý loại nội dung đang nói.
+- **Kiểm thử CI:** `npm test` gồm 9 bài FFmpeg và 12 bài biên tập; `node tests/http.cjs` gồm 5 bài API.
+
 ## Tính năng và hạn chế
 - Cắt/ghép theo thứ tự timeline, kiểm tra thời điểm phân đoạn, sinh phụ đề SRT bám theo đoạn giữ lại.
 - Dựng video với zoom tĩnh theo từng đoạn, punch-in giữa một số đoạn, fade-to-black ngắn, điều chỉnh màu và chuẩn hóa/tăng âm lượng.
