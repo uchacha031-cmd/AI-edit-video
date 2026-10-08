@@ -3,6 +3,7 @@ name: Video Editor CI
 on:
   push:
     branches:
+      - main
       - fix/ai-auto-video-editor-2026-10-08
   pull_request:
     branches: [main]
