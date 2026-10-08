@@ -34,7 +34,14 @@ export async function extractMediaMetadata(filePath: string): Promise<VideoMetad
         const videoStream = info.streams?.find((s: any) => s.codec_type === 'video');
         const audioStream = info.streams?.find((s: any) => s.codec_type === 'audio');
 
+        if (!videoStream || !Number.isFinite(Number(videoStream.width)) || !Number.isFinite(Number(videoStream.height))
+          || Number(videoStream.width) < 2 || Number(videoStream.height) < 2) {
+          throw new Error('Nguồn không chứa luồng hình ảnh hợp lệ (video stream).');
+        }
         const duration = parseFloat(info.format?.duration || videoStream?.duration || '0');
+        if (!Number.isFinite(duration) || duration <= 0) {
+          throw new Error('Không đọc được thời lượng video từ ffprobe.');
+        }
         const filesize = parseInt(info.format?.size || '0', 10);
         const width = videoStream ? parseInt(videoStream.width || '0', 10) : 0;
         const height = videoStream ? parseInt(videoStream.height || '0', 10) : 0;
@@ -66,7 +73,7 @@ export async function extractMediaMetadata(filePath: string): Promise<VideoMetad
         const metadata: VideoMetadata = {
           filename: path.basename(filePath),
           filesize,
-          duration: Math.max(0.1, duration),
+          duration,
           width,
           height,
           fps: fps || 30,
@@ -167,19 +174,19 @@ export async function detectSceneChanges(
     let settled = false;
     const timer = setTimeout(() => { proc.kill('SIGKILL'); }, 15_000);
     timer.unref();
-    const finish = (result: number[]) => {
+    const finish = (result: number[] | null) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve({ timestamps: result, analyzedSeconds });
+      resolve({ timestamps: result || [], analyzedSeconds: result === null ? 0 : analyzedSeconds });
     };
     proc.stderr.on('data', chunk => {
       log += String(chunk);
       if (log.length > 512_000) log = log.slice(-512_000);
     });
-    proc.on('error', () => finish([]));
+    proc.on('error', () => finish(null));
     proc.on('close', code => {
-      if (code !== 0) return finish([]);
+      if (code !== 0) return finish(null);
       const matches = [...log.matchAll(/Parsed_showinfo[^\n]*pts_time:\s*([0-9.]+)/g)];
       finish(cleanSceneCuts(matches.map(m => Number(m[1])), analyzedSeconds));
     });
