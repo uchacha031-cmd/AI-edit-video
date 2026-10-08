@@ -6,7 +6,8 @@ const { execFileSync } = require('node:child_process');
 require('tsx/cjs');
 const root = path.resolve(__dirname,'..');
 const { buildConservativeEditTimeline, cleanSceneCuts } = require(path.join(root,'server/editing.ts'));
-const { parseSilencedetectLog, detectSceneChanges } = require(path.join(root,'server/media.ts'));
+const { parseSilencedetectLog, detectSceneChanges, extractMediaMetadata } = require(path.join(root,'server/media.ts'));
+const { validateAndSanitizeEditPlan } = require(path.join(root,'server/validator.ts'));
 const approx = (actual, expected, delta=0.05) => assert.ok(Math.abs(actual-expected)<delta, actual+' vs '+expected);
 const pause = (start,end) => ({start,end,duration:end-start});
 
@@ -48,6 +49,26 @@ const pause = (start,end) => ({start,end,duration:end-start});
 
   assert.deepEqual(cleanSceneCuts([2,2.1,1,4,NaN,9],10),[1,2,4,9]);
   console.log('PASS visual cut timestamps de-duplicated and bounded');
+  const scanFailure=await detectSceneChanges(path.join(os.tmpdir(),'missing_ai_video_987654321.mp4'),3,3);
+  assert.deepEqual(scanFailure,{timestamps:[],analyzedSeconds:0});
+  console.log('PASS scene scan failure is labeled as no evidence, not no cuts');
+
+  const rawPlan={
+    project:{title:'Invalid input',targetDuration:3},
+    segments:[null,{id:'test',sourceStart:0,sourceEnd:2,zoom:NaN}],
+    crop:{aspectRatio:'16:9',focalPoint:{x:NaN,y:Infinity}},
+    audio:{volumeBoost:Infinity,silenceThresholdDb:NaN},
+    export:{aspectRatio:'16:9',resolution:'720p'},
+  };
+  const meta={filename:'test.mp4',duration:3,width:320,height:180,fps:30,videoCodec:'h264',hasAudio:false};
+  const checked=validateAndSanitizeEditPlan(rawPlan,meta);
+  assert.equal(checked.valid,true,JSON.stringify(checked.errors));
+  assert.equal(checked.sanitizedPlan.segments.length,1);
+  assert.equal(checked.sanitizedPlan.segments[0].zoom,1);
+  assert.deepEqual(checked.sanitizedPlan.crop.focalPoint,{x:0.5,y:0.5});
+  assert.equal(checked.sanitizedPlan.audio.volumeBoost,1);
+  console.log('PASS invalid plan data cannot inject NaN into FFmpeg');
+
 
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'ai-edit-scenes-'));
   try {
@@ -60,7 +81,13 @@ const pause = (start,end) => ({start,end,duration:end-start});
     const result=await detectSceneChanges(video,2.8,2.8);
     assert.ok(result.timestamps.some(t=>Math.abs(t-1.4)<0.5),JSON.stringify(result));
     console.log('PASS FFmpeg detects an actual visual scene cut');
+    const audioOnly=path.join(dir,'audio_only.mp4');
+    execFileSync('ffmpeg',['-hide_banner','-loglevel','error','-y',
+      '-f','lavfi','-i','sine=frequency=440:duration=1.0',
+      '-c:a','aac','-vn',audioOnly]);
+    await assert.rejects(()=>extractMediaMetadata(audioOnly),/video stream/);
+    console.log('PASS audio-only media cannot masquerade as a valid video');
   } finally {fs.rmSync(dir,{recursive:true,force:true});}
 
-  console.log('RESULT 8/8 EDITORIAL PASS');
+  console.log('RESULT 11/11 EDITORIAL PASS');
 })().catch(err=>{console.error(err);process.exitCode=1;});
