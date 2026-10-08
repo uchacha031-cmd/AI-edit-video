@@ -8,6 +8,7 @@ import {
   AiDiagnostics,
 } from '../src/types/editor.js';
 import { validateAndSanitizeEditPlan } from './validator.js';
+import { buildConservativeEditTimeline } from './editing.js';
 
 // Helper for timeout
 function withTimeout<T>(promise: Promise<T>, ms: number, errorMsg: string): Promise<T> {
@@ -319,69 +320,41 @@ export function buildDeterministicPlan(
   const duration = meta.duration;
   const segments: any[] = [];
   
-  // Cut silence periods longer than 0.8s
-  const cutRanges = silences.filter((s) => s.duration >= 0.7);
-  let curStart = 0;
-  let segIndex = 1;
-
-  for (const s of cutRanges) {
-    if (s.start > curStart + 0.3) {
-      segments.push({
-        id: `seg_${segIndex++}`,
-        sourceStart: Number(curStart.toFixed(2)),
-        sourceEnd: Number(s.start.toFixed(2)),
-        keep: true,
-        confidence: 0.9,
-        reason: segIndex === 2 ? 'Đoạn mở đầu nổi bật (Hook)' : 'Nội dung chính giữa các khoảng dừng',
-        role: segIndex === 2 ? 'hook' : 'core',
-        zoom: 1.0,
-        focalPoint: { x: 0.5, y: 0.5 },
-      });
-    }
-
+  // Conservative non-AI editing: leave room around speech and smooth short cuts.
+  // Reference principle: Auto-Editor --margin and --smooth.
+  const timeline = buildConservativeEditTimeline(duration, silences);
+  let segIndex = 0;
+  const parts = [
+    ...timeline.kept.map(range => ({ ...range, keep: true })),
+    ...timeline.removed.map(range => ({ ...range, keep: false })),
+  ].sort((a, b) => a.start - b.start || a.end - b.end);
+  for (const part of parts) {
+    if (part.end <= part.start) continue;
+    const first = segIndex === 0;
+    const role = part.keep ? (first ? 'hook' : 'core') : 'silence';
     segments.push({
-      id: `seg_${segIndex++}`,
-      sourceStart: Number(s.start.toFixed(2)),
-      sourceEnd: Number(s.end.toFixed(2)),
-      keep: false,
-      confidence: 0.95,
-      reason: `Khoảng lặng tạm dừng ${s.duration.toFixed(1)}s (đã cắt)`,
-      role: 'silence',
-      zoom: 1.0,
-      focalPoint: { x: 0.5, y: 0.5 },
-    });
-
-    curStart = s.end;
-  }
-
-  if (curStart < duration - 0.3) {
-    segments.push({
-      id: `seg_${segIndex++}`,
-      sourceStart: Number(curStart.toFixed(2)),
-      sourceEnd: Number(duration.toFixed(2)),
-      keep: true,
-      confidence: 0.85,
-      reason: 'Đoạn kết luận và chào kết',
-      role: 'outro',
+      id: 'seg_' + (++segIndex),
+      sourceStart: part.start,
+      sourceEnd: part.end,
+      keep: part.keep,
+      confidence: part.keep ? 0.80 : 0.92,
+      reason: part.keep
+        ? 'Đoạn được giữ theo tín hiệu âm thanh, có khoảng đệm để tránh cắt mất lời nói'
+        : 'Khoảng lặng đã trừ biên an toàn đầu/cuối',
+      role,
       zoom: 1.0,
       focalPoint: { x: 0.5, y: 0.5 },
     });
   }
-
-  if (segments.length === 0) {
-    segments.push({
-      id: 'seg_1',
-      sourceStart: 0,
-      sourceEnd: Number(duration.toFixed(2)),
-      keep: true,
-      confidence: 1.0,
-      reason: 'Toàn bộ nội dung video gốc',
-      role: 'core',
-      zoom: 1.0,
-      focalPoint: { x: 0.5, y: 0.5 },
-    });
+  const estimatedKeptDuration = timeline.kept.reduce((sum, p) => sum + p.end - p.start, 0);
+  const planningWarnings = [...timeline.warnings];
+  if (estimatedKeptDuration > targetDuration + 1) {
+    planningWarnings.push(
+      'Bản dựng cơ bản dài khoảng ' + estimatedKeptDuration.toFixed(1) + 's, vượt mục tiêu ' + targetDuration.toFixed(1) + 's. ' +
+      'Không tự ý cắt bỏ lời nói; hãy dùng AI hoặc chọn thủ công để rút ngắn thêm.'
+    );
   }
-
+  planningWarnings.push('Chế độ cơ bản chỉ phân tích khoảng lặng, không nhận diện ý nghĩa, highlight hay phiên âm.');
   const rawPlan: any = {
     project: {
       title: `Bản dựng ${preset}`,
@@ -428,7 +401,7 @@ export function buildDeterministicPlan(
       targetDuration: Math.min(targetDuration, duration),
       actualEstimatedDuration: duration,
     },
-    warnings: [],
+    warnings: planningWarnings,
   };
 
   const validation = validateAndSanitizeEditPlan(rawPlan, meta);
@@ -519,6 +492,8 @@ export async function generateEditPlanWithGemini(
     targetDuration: number;
     userPrompt?: string;
     aspectRatio?: '9:16' | '16:9' | '1:1';
+    sceneCuts?: number[];
+    sceneCoverageSeconds?: number;
   }
 ): Promise<{
   success: boolean;
@@ -627,6 +602,15 @@ export async function generateEditPlanWithGemini(
     ? `FFmpeg detected ${silences.length} silence intervals: ${JSON.stringify(silences.slice(0, 15))}`
     : 'No silence intervals detected by server audio analyzer.';
 
+  const sceneSummary = (options.sceneCoverageSeconds || 0) <= 0
+    ? 'Visual scene analysis was unavailable or timed out. No scene-change evidence was measured.'
+    : Array.isArray(options.sceneCuts) && options.sceneCuts.length > 0
+      ? 'FFmpeg visual cut candidates in first ' + Number(options.sceneCoverageSeconds).toFixed(1) +
+        ' seconds (timestamps): ' + options.sceneCuts.slice(0, 50).map(t => Number(t).toFixed(2)).join(', ') +
+        '. These indicate shot boundaries only, NOT content quality or speech.'
+      : 'FFmpeg sampled first ' + Number(options.sceneCoverageSeconds).toFixed(1) +
+        ' seconds without detecting reliable scene transitions. No inference is possible for unsampled content.';
+
   const systemPrompt = `You are an expert Hollywood and Viral Video Editor (AI Auto Video Editor).
 Your job is to analyze the user's video, understand its semantic moments, speech, flow, and visual interest, then produce an EDIT PLAN JSON strictly adhering to the schema.
 
@@ -639,6 +623,7 @@ CRITICAL EDITORIAL PRINCIPLES:
 6. The target duration is approximately ${options.targetDuration} seconds.
 7. Subtitles: Transcribe the spoken words (in the original language, e.g. Vietnamese or English) with accurate start and end timestamps.
 8. Silence Guidance: ${silenceSummary}.
+8b. Visual cut evidence: ${sceneSummary}. Only source measurements are evidence; never invent details for unreviewed scenes.
 9. Preset selected: "${options.preset}".
 10. Target aspect ratio: "${options.aspectRatio || '9:16'}".
 ${options.userPrompt ? `USER SPECIAL INSTRUCTIONS: "${options.userPrompt}"` : ''}
@@ -721,6 +706,27 @@ Strictly output valid JSON matching the requested schema. Never output markdown 
   // If succeeded
   if (parsedJson) {
     const validation = validateAndSanitizeEditPlan(parsedJson, meta);
+    const noReliableSegments = !Array.isArray(parsedJson.segments) ||
+      validation.warnings.some(w => w.includes('Không có phân đoạn hợp lệ'));
+    if (!validation.valid || noReliableSegments) {
+      return {
+        success: false,
+        httpStatus: 422,
+        error: 'Gemini đã phản hồi nhưng kế hoạch biên tập không đủ hợp lệ để dùng. Vui lòng thử lại hoặc chọn chế độ cắt cơ bản.',
+        technicalDetails: [...validation.errors, ...validation.warnings].slice(0, 10).join('; '),
+        diagnostics: {
+          selectedModel: SERVER_CONFIG.GEMINI_MODEL,
+          videoFilename: meta.filename, videoSizeBytes: meta.filesize, videoDurationSec: meta.duration,
+          uploadStatus, geminiFileUri: geminiFile?.uri, geminiFileState: geminiFile?.state,
+          analysisAttempt: attemptNumber, maxAttempts, httpStatus: 422, requestStartTime,
+          requestEndTime, durationMs, totalRetryDelayMs,
+          errorDetails: 'AI response did not yield a valid editable timeline',
+        },
+      };
+    }
+    if (validation.sanitizedPlan.subtitles.length > 0) {
+      validation.sanitizedPlan.warnings.push('Phụ đề do AI tạo ra chưa được kiểm chứng với bản ghi âm. Hãy kiểm tra trước khi xuất.');
+    }
     const qualityCheck = await runQualityCheck(validation.sanitizedPlan, options.userPrompt);
 
     return {
