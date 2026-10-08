@@ -6,7 +6,7 @@ import fsSync from 'fs';
 import { createServer as createViteServer } from 'vite';
 import { SERVER_CONFIG, ensureStorageDirectories } from './server/config.js';
 import { extractMediaMetadata, detectSilence, extractThumbnails } from './server/media.js';
-import { generateEditPlanWithGemini, modifyPlanWithNaturalLanguage } from './server/gemini.js';
+import { generateEditPlanWithGemini, modifyPlanWithNaturalLanguage, buildDeterministicPlan } from './server/gemini.js';
 import { renderEditPlan, cancelRender } from './server/renderer.js';
 import { getOrCreateSampleVideo } from './server/sampleVideo.js';
 import { validateAndSanitizeEditPlan } from './server/validator.js';
@@ -15,8 +15,8 @@ const app = express();
 const PORT = 3000;
 
 // Body parsers
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
 // Ensure all temp storage directories exist and are writable
 await ensureStorageDirectories();
@@ -25,7 +25,8 @@ await ensureStorageDirectories();
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, SERVER_CONFIG.UPLOAD_DIR),
   filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname) || '.mp4';
+    const rawExt = path.extname(file.originalname).toLowerCase();
+    const ext = /^\.[a-z0-9]{2,6}$/.test(rawExt) ? rawExt : '.mp4';
     const unique = `${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
     cb(null, `upload_${unique}${ext}`);
   },
@@ -35,7 +36,7 @@ const upload = multer({
   storage,
   limits: { fileSize: SERVER_CONFIG.MAX_FILE_SIZE_BYTES },
   fileFilter: (req, file, cb) => {
-    if (SERVER_CONFIG.ALLOWED_MIME_TYPES.includes(file.mimetype) || file.mimetype.startsWith('video/')) {
+    if (SERVER_CONFIG.ALLOWED_MIME_TYPES.includes(file.mimetype)) {
       cb(null, true);
     } else {
       cb(new Error(`Unsupported video mime type: ${file.mimetype}`));
@@ -48,6 +49,8 @@ const upload = multer({
  */
 function streamMediaFile(req: Request, res: Response, filePath: string, contentType = 'video/mp4') {
   try {
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
     if (!fsSync.existsSync(filePath)) {
       return res.status(404).send('File not found');
     }
@@ -55,19 +58,24 @@ function streamMediaFile(req: Request, res: Response, filePath: string, contentT
     const range = req.headers.range;
 
     if (range) {
-      const parts = range.replace(/bytes=/, '').split('-');
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
+      const match = /^bytes=(\d+)-(\d*)$/.exec(range);
+      const start = match ? Number(match[1]) : NaN;
+      const end = match && match[2] ? Number(match[2]) : stat.size - 1;
+      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start || stat.size === 0) {
+        res.status(416).setHeader('Content-Range', 'bytes */' + stat.size).end();
+        return;
+      }
+      const safeEnd = Math.min(end, stat.size - 1);
 
       if (start >= stat.size) {
         res.status(416).setHeader('Content-Range', `bytes */${stat.size}`).end();
         return;
       }
 
-      const chunksize = end - start + 1;
-      const file = fsSync.createReadStream(filePath, { start, end });
+      const chunksize = safeEnd - start + 1;
+      const file = fsSync.createReadStream(filePath, { start, end: safeEnd });
       res.writeHead(206, {
-        'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+        'Content-Range': `bytes ${start}-${safeEnd}/${stat.size}`,
         'Accept-Ranges': 'bytes',
         'Content-Length': chunksize,
         'Content-Type': contentType,
@@ -82,10 +90,50 @@ function streamMediaFile(req: Request, res: Response, filePath: string, contentT
     }
   } catch (err: any) {
     if (!res.headersSent) {
-      res.status(500).send(`Streaming error: ${err.message}`);
+      res.status(500).send('Unable to stream media');
     }
   }
 }
+
+// Accept only app-generated IDs, never arbitrary file paths.
+function resolveSourceFile(videoId: unknown): string | null {
+  if (typeof videoId !== 'string' ||
+      !/^(upload_\d+_[a-z0-9]{5,12}\.[a-z0-9]{2,6}|sample_(talking_head|landscape_demo|no_audio)\.mp4)$/i.test(videoId)) {
+    return null;
+  }
+  const dir = videoId.startsWith('sample_') ? SERVER_CONFIG.SAMPLES_DIR : SERVER_CONFIG.UPLOAD_DIR;
+  const resolved = path.resolve(dir, videoId);
+  return fsSync.existsSync(resolved) ? resolved : null;
+}
+
+// Non-sensitive readiness information for testing the AI Studio preview.
+app.get('/api/health', (_req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    success: true,
+    app: 'AI Auto Video Editor',
+    geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
+    note: 'This endpoint checks the web server, not Gemini or FFmpeg availability.',
+  });
+});
+
+type RenderProgress = { percent: number; status: 'rendering' | 'completed' | 'cancelled' | 'error' };
+const renderProgress = new Map<string, RenderProgress>();
+function updateRenderProgress(id: string, state: RenderProgress): void {
+  renderProgress.set(id, state);
+  if (state.status !== 'rendering') {
+    const cleanup = setTimeout(() => { if (renderProgress.get(id) === state) renderProgress.delete(id); }, 60_000);
+    cleanup.unref();
+  }
+}
+app.get('/api/render-progress/:renderId', (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const id = req.params.renderId;
+  if (!/^render_[0-9a-z_-]{12,80}$/i.test(id)) return res.status(400).json({ success: false });
+  const value = renderProgress.get(id);
+  if (!value) return res.status(404).json({ success: false, error: 'Render not active' });
+  res.json({ success: true, ...value });
+});
 
 // ================= API ENDPOINTS ================= //
 
@@ -103,6 +151,10 @@ app.post('/api/upload', upload.single('video'), async (req: Request, res: Respon
 
     // 1. Technical metadata via ffprobe
     const metadata = await extractMediaMetadata(filePath);
+    if (metadata.duration > SERVER_CONFIG.MAX_SOURCE_DURATION_SEC) {
+      await fs.unlink(filePath).catch(() => {});
+      return res.status(413).json({ success: false, error: 'Video dài hơn giới hạn 10 phút của ứng dụng.' });
+    }
 
     // 2. Silence detection via ffmpeg
     const silences = metadata.hasAudio ? await detectSilence(filePath) : [];
@@ -114,14 +166,14 @@ app.post('/api/upload', upload.single('video'), async (req: Request, res: Respon
       success: true,
       videoId: filename,
       mediaUrl: `/api/media/upload/${filename}`,
-      filePath,
       metadata,
       silences,
       thumbnails,
     });
   } catch (err: any) {
     console.error('Upload handling error:', err);
-    res.status(500).json({ error: err.message || 'Failed to process uploaded video' });
+    if (req.file?.path) await fs.unlink(req.file.path).catch(() => {});
+    res.status(500).json({ error: 'Video không hợp lệ hoặc không thể xử lý. Hãy thử tệp video khác.' });
   }
 });
 
@@ -130,7 +182,11 @@ app.post('/api/upload', upload.single('video'), async (req: Request, res: Respon
  */
 app.post('/api/sample', async (req: Request, res: Response) => {
   try {
-    const type = (req.body.type || 'talking_head') as 'talking_head' | 'landscape_demo' | 'no_audio';
+    const rawType = req.body?.type || 'talking_head';
+    if (!['talking_head', 'landscape_demo', 'no_audio'].includes(rawType)) {
+      return res.status(400).json({ success: false, error: 'Loại video mẫu không hợp lệ.' });
+    }
+    const type = rawType as 'talking_head' | 'landscape_demo' | 'no_audio';
     const filePath = await getOrCreateSampleVideo(type);
     const filename = path.basename(filePath);
 
@@ -142,7 +198,6 @@ app.post('/api/sample', async (req: Request, res: Response) => {
       success: true,
       videoId: filename,
       mediaUrl: `/api/media/sample/${filename}`,
-      filePath,
       metadata,
       silences,
       thumbnails,
@@ -150,6 +205,26 @@ app.post('/api/sample', async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error('Sample generation error:', err);
     res.status(500).json({ error: err.message || 'Failed to load sample video' });
+  }
+});
+
+/**
+ * POST /api/offline-plan - Rule-based edit plan, not Gemini analysis.
+ */
+app.post('/api/offline-plan', async (req: Request, res: Response) => {
+  try {
+    const filePath = resolveSourceFile(req.body?.videoId);
+    if (!filePath) return res.status(404).json({ success: false, error: 'Video nguồn không tồn tại' });
+    const metadata = await extractMediaMetadata(filePath);
+    const silences = metadata.hasAudio ? await detectSilence(filePath) : [];
+    const preset = typeof req.body.preset === 'string' ? req.body.preset.slice(0, 60) : 'Clean Minimal';
+    const duration = Math.min(metadata.duration, Math.max(1, Number(req.body.targetDuration) || 30));
+    const plan = buildDeterministicPlan(metadata, silences, preset, duration);
+    const validation = validateAndSanitizeEditPlan(plan, metadata);
+    if (!validation.valid) return res.status(422).json({ success: false, error: validation.errors.join('; ') });
+    res.json({ success: true, plan: validation.sanitizedPlan, mode: 'offline-rule-based' });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message || 'Không tạo được kế hoạch offline' });
   }
 });
 
@@ -163,12 +238,8 @@ app.post('/api/analyze', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Missing videoId' });
     }
 
-    // Determine path
-    let filePath = path.join(SERVER_CONFIG.UPLOAD_DIR, videoId);
-    if (!fsSync.existsSync(filePath)) {
-      filePath = path.join(SERVER_CONFIG.SAMPLES_DIR, videoId);
-    }
-    if (!fsSync.existsSync(filePath)) {
+    const filePath = resolveSourceFile(videoId);
+    if (!filePath) {
       return res.status(404).json({ error: 'Source video file not found' });
     }
 
@@ -220,19 +291,16 @@ app.post('/api/modify-plan', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Missing plan or command' });
     }
 
-    let filePath = path.join(SERVER_CONFIG.UPLOAD_DIR, videoId || plan.source?.filename);
-    if (!fsSync.existsSync(filePath)) {
-      filePath = path.join(SERVER_CONFIG.SAMPLES_DIR, videoId || plan.source?.filename);
-    }
-
-    const metadata = fsSync.existsSync(filePath)
-      ? await extractMediaMetadata(filePath)
-      : (plan.source as any);
+    const filePath = resolveSourceFile(videoId || plan.source?.filename);
+    if (!filePath) return res.status(404).json({ error: 'Source video file not found' });
+    const metadata = await extractMediaMetadata(filePath);
 
     const result = await modifyPlanWithNaturalLanguage(plan, metadata, command);
+    const validation = validateAndSanitizeEditPlan(result.plan, metadata);
+    if (!validation.valid) return res.status(422).json({ error: validation.errors.join('; ') });
     res.json({
       success: true,
-      plan: result.plan,
+      plan: validation.sanitizedPlan,
       explanation: result.explanation,
     });
   } catch (err: any) {
@@ -247,13 +315,9 @@ app.post('/api/modify-plan', async (req: Request, res: Response) => {
 app.post('/api/validate-plan', async (req: Request, res: Response) => {
   try {
     const { plan, videoId } = req.body;
-    let filePath = path.join(SERVER_CONFIG.UPLOAD_DIR, videoId || plan.source?.filename);
-    if (!fsSync.existsSync(filePath)) {
-      filePath = path.join(SERVER_CONFIG.SAMPLES_DIR, videoId || plan.source?.filename);
-    }
-    const metadata = fsSync.existsSync(filePath)
-      ? await extractMediaMetadata(filePath)
-      : (plan.source as any);
+    const filePath = resolveSourceFile(videoId || plan?.source?.filename);
+    if (!filePath) return res.status(404).json({ valid: false, errors: ['Source video file not found'] });
+    const metadata = await extractMediaMetadata(filePath);
 
     const result = validateAndSanitizeEditPlan(plan, metadata);
     res.json(result);
@@ -267,23 +331,30 @@ app.post('/api/validate-plan', async (req: Request, res: Response) => {
  */
 app.post('/api/render', async (req: Request, res: Response) => {
   try {
-    const { plan, videoId, burnSubtitles } = req.body;
+    const { plan, videoId, burnSubtitles, renderId } = req.body;
     if (!plan || !videoId) {
       return res.status(400).json({ error: 'Missing plan or videoId' });
     }
 
-    let filePath = path.join(SERVER_CONFIG.UPLOAD_DIR, videoId);
-    if (!fsSync.existsSync(filePath)) {
-      filePath = path.join(SERVER_CONFIG.SAMPLES_DIR, videoId);
-    }
-    if (!fsSync.existsSync(filePath)) {
+    const filePath = resolveSourceFile(videoId);
+    if (!filePath) {
       return res.status(404).json({ error: 'Source video file not found for render' });
     }
 
-    const renderId = `${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-    const result = await renderEditPlan(filePath, plan, renderId, {
+    const validation = validateAndSanitizeEditPlan(plan, await extractMediaMetadata(filePath));
+    if (!validation.valid) return res.status(422).json({ success: false, error: validation.errors.join('; ') });
+    if (typeof renderId !== 'string' || !/^render_[0-9a-z_-]{12,80}$/i.test(renderId)) {
+      return res.status(400).json({ success: false, error: 'Invalid render ID' });
+    }
+    if (renderProgress.get(renderId)?.status === 'rendering') {
+      return res.status(409).json({ success: false, error: 'Render ID is already active' });
+    }
+    updateRenderProgress(renderId, { status: 'rendering', percent: 0 });
+    const result = await renderEditPlan(filePath, validation.sanitizedPlan, renderId, {
       burnSubtitles: burnSubtitles !== false,
+      onProgress: (value) => updateRenderProgress(renderId, { status: 'rendering', percent: value }),
     });
+    updateRenderProgress(renderId, { status: 'completed', percent: 100 });
 
     res.json({
       success: true,
@@ -291,6 +362,10 @@ app.post('/api/render', async (req: Request, res: Response) => {
       result,
     });
   } catch (err: any) {
+    const id = req.body?.renderId;
+    if (typeof id === 'string' && /^render_[0-9a-z_-]{12,80}$/i.test(id)) {
+      updateRenderProgress(id, { status: String(err?.message || '').includes('cancelled') ? 'cancelled' : 'error', percent: 0 });
+    }
     console.error('Render error:', err);
     res.status(500).json({ error: err.message || 'Render process failed' });
   }
@@ -301,34 +376,51 @@ app.post('/api/render', async (req: Request, res: Response) => {
  */
 app.post('/api/cancel-render', (req: Request, res: Response) => {
   const { renderId } = req.body;
-  if (!renderId) return res.status(400).json({ error: 'Missing renderId' });
+  if (typeof renderId !== 'string' || !/^render_[0-9a-z_-]{12,80}$/i.test(renderId)) {
+    return res.status(400).json({ error: 'Invalid renderId' });
+  }
   const cancelled = cancelRender(renderId);
+  updateRenderProgress(renderId, { status: 'cancelled', percent: 0 });
   res.json({ success: cancelled });
 });
 
 // ================= MEDIA STREAMING & DOWNLOADS ================= //
 
+// Restrict media serving to filenames generated by this application.
+const uploadFilenamePattern = /^upload_\d+_[a-z0-9]{5,12}\.[a-z0-9]{2,6}$/i;
+const sampleFilenamePattern = /^sample_(talking_head|landscape_demo|no_audio)\.mp4$/;
+const renderFilenamePattern = /^(edited_render_[0-9a-z_-]{12,80}\.mp4|subtitles_render_[0-9a-z_-]{12,80}\.srt)$/i;
+const thumbnailFilenamePattern = /^[a-z0-9_-]{3,120}\.(jpe?g|png|webp)$/i;
+function safeMediaFilename(name: unknown, pattern: RegExp): string | null {
+  return typeof name === 'string' && pattern.test(name) ? name : null;
+}
+
+
 app.get('/api/media/upload/:file', (req: Request, res: Response) => {
-  const safeFilename = path.basename(req.params.file);
+  const safeFilename = safeMediaFilename(req.params.file, uploadFilenamePattern);
+  if (!safeFilename) return res.status(404).send('Media not found');
   const p = path.join(SERVER_CONFIG.UPLOAD_DIR, safeFilename);
   streamMediaFile(req, res, p);
 });
 
 app.get('/api/media/render/:file', (req: Request, res: Response) => {
-  const safeFilename = path.basename(req.params.file);
+  const safeFilename = safeMediaFilename(req.params.file, renderFilenamePattern);
+  if (!safeFilename) return res.status(404).send('Media not found');
   const p = path.join(SERVER_CONFIG.RENDER_DIR, safeFilename);
   const isSrt = safeFilename.endsWith('.srt');
   streamMediaFile(req, res, p, isSrt ? 'text/plain; charset=utf-8' : 'video/mp4');
 });
 
 app.get('/api/media/sample/:file', (req: Request, res: Response) => {
-  const safeFilename = path.basename(req.params.file);
+  const safeFilename = safeMediaFilename(req.params.file, sampleFilenamePattern);
+  if (!safeFilename) return res.status(404).send('Media not found');
   const p = path.join(SERVER_CONFIG.SAMPLES_DIR, safeFilename);
   streamMediaFile(req, res, p);
 });
 
 app.get('/api/media/thumb/:file', (req: Request, res: Response) => {
-  const safeFilename = path.basename(req.params.file);
+  const safeFilename = safeMediaFilename(req.params.file, thumbnailFilenamePattern);
+  if (!safeFilename) return res.status(404).send('Media not found');
   const p = path.join(SERVER_CONFIG.THUMB_DIR, safeFilename);
   res.sendFile(p);
 });
@@ -345,7 +437,9 @@ app.get('/api/download-source', (req: Request, res: Response) => {
 
 app.get('/api/download/:type/:file', (req: Request, res: Response) => {
   const type = req.params.type;
-  const safeFilename = path.basename(req.params.file);
+  if (type !== 'render' && type !== 'upload') return res.status(404).json({ error: 'Invalid download type' });
+  const safeFilename = safeMediaFilename(req.params.file, type === 'render' ? renderFilenamePattern : uploadFilenamePattern);
+  if (!safeFilename) return res.status(404).json({ error: 'Invalid filename' });
   const dir = type === 'render' ? SERVER_CONFIG.RENDER_DIR : SERVER_CONFIG.UPLOAD_DIR;
   const p = path.join(dir, safeFilename);
   res.download(p, safeFilename);
@@ -369,7 +463,7 @@ app.use((err: any, req: Request, res: Response, next: any) => {
   res.status(status).json({
     success: false,
     error: err.message || 'Lỗi xử lý nội bộ trên máy chủ',
-    technicalDetails: String(err.stack || err),
+    technicalDetails: process.env.NODE_ENV === 'production' ? undefined : String(err.message || err),
   });
 });
 

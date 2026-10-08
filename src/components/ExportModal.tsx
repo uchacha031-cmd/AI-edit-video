@@ -14,6 +14,7 @@ interface ExportModalProps {
   isOpen: boolean;
   isRendering: boolean;
   renderResult: RenderResult | null;
+  renderProgress?: number | null;
   errorMessage?: string;
   onClose: () => void;
   onCancelRender?: () => void;
@@ -24,6 +25,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   isOpen,
   isRendering,
   renderResult,
+  renderProgress,
   errorMessage,
   onClose,
   onCancelRender,
@@ -85,6 +87,14 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               <span className="text-xs text-slate-400 block font-mono">
                 Cắt đoạn &rarr; Ghép nối &rarr; Căn khung &rarr; Phụ đề &rarr; Chuẩn hóa âm &rarr; Mã hóa H.264
               </span>
+              {typeof renderProgress === 'number' && (
+                <div className="mt-4 mx-auto max-w-sm space-y-2" role="progressbar" aria-label="Tiến độ dựng video" aria-valuemin={0} aria-valuemax={100} aria-valuenow={renderProgress}>
+                  <div className="flex justify-between text-xs text-slate-300"><span>Tiến độ FFmpeg</span><span>{Math.round(renderProgress)}%</span></div>
+                  <div className="w-full h-2 rounded-full bg-slate-700 overflow-hidden">
+                    <div className="h-full bg-indigo-400 transition-all duration-300" style={{ width: Math.min(100, Math.max(0, renderProgress)) + '%' }} />
+                  </div>
+                </div>
+              )}
             </div>
 
             {onCancelRender && (

@@ -7,6 +7,7 @@ import { extractMediaMetadata } from './media.js';
 
 // Active render processes for cancellation support
 const activeRenders = new Map<string, ChildProcess>();
+const cancelledRenders = new Set<string>();
 
 /**
  * Format seconds to SRT timestamp: HH:MM:SS,mmm
@@ -26,58 +27,38 @@ function formatSrtTimestamp(seconds: number): string {
  * Subtitle timestamps are mapped to the new edited timeline!
  */
 export function generateSrtContent(subtitles: EditSubtitle[], keptSegments: { sourceStart: number; sourceEnd: number }[]): string {
-  if (!subtitles || subtitles.length === 0) return '';
-
-  let srt = '';
-  let count = 1;
-
-  // Map source timestamps into new concatenated timeline
-  for (const sub of subtitles) {
-    let mappedStart: number | null = null;
-    let mappedEnd: number | null = null;
-    let elapsed = 0;
-
-    for (const seg of keptSegments) {
-      const segDur = seg.sourceEnd - seg.sourceStart;
-      
-      // Check if subtitle overlaps with kept segment
-      if (sub.end > seg.sourceStart && sub.start < seg.sourceEnd) {
-        const segOverlapStart = Math.max(sub.start, seg.sourceStart);
-        const segOverlapEnd = Math.min(sub.end, seg.sourceEnd);
-        
-        const subRelativeStart = elapsed + (segOverlapStart - seg.sourceStart);
-        const subRelativeEnd = elapsed + (segOverlapEnd - seg.sourceStart);
-
-        if (mappedStart === null || subRelativeStart < mappedStart) {
-          mappedStart = subRelativeStart;
-        }
-        mappedEnd = subRelativeEnd;
+  if (!Array.isArray(subtitles) || subtitles.length === 0) return '';
+  const cues: { start: number; end: number; text: string }[] = [];
+  let elapsed = 0;
+  for (const seg of keptSegments) {
+    const duration = seg.sourceEnd - seg.sourceStart;
+    if (!Number.isFinite(duration) || duration <= 0) continue;
+    for (const sub of subtitles) {
+      if (!sub.text?.trim()) continue;
+      const start = Math.max(seg.sourceStart, sub.start);
+      const end = Math.min(seg.sourceEnd, sub.end);
+      if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
+        cues.push({ start: elapsed + start - seg.sourceStart, end: elapsed + end - seg.sourceStart, text: sub.text.replace(/\r/g, '').trim() });
       }
-      elapsed += segDur;
     }
-
-    if (mappedStart !== null && mappedEnd !== null && mappedEnd > mappedStart) {
-      srt += `${count}\n`;
-      srt += `${formatSrtTimestamp(mappedStart)} --> ${formatSrtTimestamp(mappedEnd)}\n`;
-      srt += `${sub.text}\n\n`;
-      count++;
-    }
+    elapsed += duration;
   }
-
-  return srt;
+  cues.sort((a, b) => a.start - b.start || a.end - b.end);
+  return cues.map((cue, i) =>
+    String(i + 1) + '\n' + formatSrtTimestamp(cue.start) + ' --> ' + formatSrtTimestamp(cue.end) + '\n' + cue.text + '\n'
+  ).join('\n');
 }
 
 /**
  * Cancel an ongoing render by renderId
  */
 export function cancelRender(renderId: string): boolean {
+  cancelledRenders.add(renderId);
+  const cleanup = setTimeout(() => cancelledRenders.delete(renderId), 5 * 60_000);
+  cleanup.unref();
   const proc = activeRenders.get(renderId);
-  if (proc) {
-    proc.kill('SIGKILL');
-    activeRenders.delete(renderId);
-    return true;
-  }
-  return false;
+  if (proc) proc.kill('SIGKILL');
+  return true;
 }
 
 /**
@@ -112,6 +93,8 @@ export async function renderEditPlan(
     if (keptSegments.length === 0) {
       throw new Error('Cannot render: No segments are marked to keep.');
     }
+
+    if (cancelledRenders.has(renderId)) throw new Error('Render cancelled by user');
 
     // 1. Determine target dimensions
     const aspect = plan.export.aspectRatio || '9:16';
@@ -154,13 +137,33 @@ export async function renderEditPlan(
 
       // Video trim
       const vLabel = `v_${i}`;
-      filterParts.push(`[0:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS[${vLabel}]`);
+      // Scale/crop each clip before concatenating to support real timeline zoom settings.
+      const requestedZoom = Number.isFinite(seg.zoom) ? seg.zoom! : 1;
+      const punchZoom = plan.effects?.zoomPunchIn && i % 2 === 1 ? 1.08 : 1;
+      const zoom = Math.min(1.35, Math.max(1, requestedZoom, punchZoom));
+      const scaleW = Math.ceil(targetW * zoom / 2) * 2;
+      const scaleH = Math.ceil(targetH * zoom / 2) * 2;
+      const fx = Math.max(0, Math.min(1, seg.focalPoint?.x ?? focalX));
+      const fy = Math.max(0, Math.min(1, seg.focalPoint?.y ?? focalY));
+      const dur = seg.sourceEnd - seg.sourceStart;
+      const fadeSec = Math.min(0.12, dur / 5);
+      const fadeIn = plan.effects?.transition === 'fade' && i > 0 ? `,fade=t=in:st=0:d=${fadeSec.toFixed(3)}` : '';
+      const fadeOut = plan.effects?.transition === 'fade' && i < keptSegments.length - 1
+        ? `,fade=t=out:st=${Math.max(0, dur - fadeSec).toFixed(3)}:d=${fadeSec.toFixed(3)}` : '';
+      const clipFilters = `[0:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS,` +
+        `scale=w=${scaleW}:h=${scaleH}:force_original_aspect_ratio=increase,` +
+        `crop=${targetW}:${targetH}:(iw-${targetW})*${fx}:(ih-${targetH})*${fy},setsar=1` +
+        `${fadeIn}${fadeOut}[${vLabel}]`;
+      filterParts.push(clipFilters);
       vConcatInputs.push(`[${vLabel}]`);
 
       // Audio trim
       if (hasAudio) {
         const aLabel = `a_${i}`;
-        filterParts.push(`[0:a]atrim=start=${start}:end=${end},asetpts=PTS-STARTPTS[${aLabel}]`);
+        const aFadeIn = plan.effects?.transition === 'fade' && i > 0 ? `,afade=t=in:st=0:d=${fadeSec.toFixed(3)}` : '';
+        const aFadeOut = plan.effects?.transition === 'fade' && i < keptSegments.length - 1
+          ? `,afade=t=out:st=${Math.max(0, dur - fadeSec).toFixed(3)}:d=${fadeSec.toFixed(3)}` : '';
+        filterParts.push(`[0:a]atrim=start=${start}:end=${end},asetpts=PTS-STARTPTS${aFadeIn}${aFadeOut}[${aLabel}]`);
         aConcatInputs.push(`[${aLabel}]`);
       }
     }
@@ -177,11 +180,10 @@ export async function renderEditPlan(
       filterParts.push(`${vConcatInputs.join('')}concat=n=${numSegs}:v=1:a=0[${currentV}]`);
     }
 
-    // Aspect ratio crop & scale filter
-    // Smart crop using focal point (scale to cover, then crop to targetW x targetH)
-    const scaleCropFilter = `scale=w=${targetW}:h=${targetH}:force_original_aspect_ratio=increase,crop=${targetW}:${targetH}:(iw-${targetW})*${focalX}:(ih-${targetH})*${focalY}`;
-    filterParts.push(`[${currentV}]${scaleCropFilter}[v_cropped]`);
-    currentV = 'v_cropped';
+    // Clip-level framing has already normalized every segment to the export size.
+    if (plan.effects?.transition === 'crossfade') {
+      warnings.push('Crossfade chưa được hỗ trợ; video dùng chuyển cảnh cắt trực tiếp.');
+    }
 
     // Color effects
     if (plan.effects?.colorFilter && plan.effects.colorFilter !== 'none') {
@@ -216,9 +218,11 @@ export async function renderEditPlan(
     if (hasAudio && plan.audio?.normalize) {
       filterParts.push(`[${currentA}]loudnorm=I=-16:TP=-1.5:LRA=11[a_norm]`);
       currentA = 'a_norm';
-    } else if (hasAudio && plan.audio?.volumeBoost && plan.audio.volumeBoost !== 1.0) {
-      filterParts.push(`[${currentA}]volume=${plan.audio.volumeBoost}[a_norm]`);
-      currentA = 'a_norm';
+    }
+    if (hasAudio && Number.isFinite(plan.audio?.volumeBoost) && plan.audio.volumeBoost !== 1) {
+      const boost = Math.max(0.5, Math.min(2, plan.audio.volumeBoost));
+      filterParts.push(`[${currentA}]volume=${boost}[a_boost]`);
+      currentA = 'a_boost';
     }
 
     const filterComplexStr = filterParts.join(';');
@@ -247,6 +251,7 @@ export async function renderEditPlan(
 
     // 5. Execute render with child_process
     await new Promise<void>((resolve, reject) => {
+      if (cancelledRenders.has(renderId)) { reject(new Error('Render cancelled by user')); return; }
       const proc = spawn('ffmpeg', ffmpegArgs);
       activeRenders.set(renderId, proc);
 
@@ -268,7 +273,8 @@ export async function renderEditPlan(
 
       proc.on('close', (code) => {
         activeRenders.delete(renderId);
-        if (code === 0) {
+        if (cancelledRenders.has(renderId)) { reject(new Error('Render cancelled by user')); }
+        else if (code === 0) {
           resolve();
         } else {
           reject(new Error(`FFmpeg render process failed with code ${code}: ${stderr.slice(-600)}`));
@@ -304,8 +310,10 @@ export async function renderEditPlan(
         onProgress: options?.onProgress,
       });
     }
+    await fs.rm(outputPath, { force: true }).catch(() => {});
     throw err;
   } finally {
+    cancelledRenders.delete(renderId);
     // Cleanup temporary job directory
     try {
       await fs.rm(tempJobDir, { recursive: true, force: true });
