@@ -602,12 +602,14 @@ export async function generateEditPlanWithGemini(
     ? `FFmpeg detected ${silences.length} silence intervals: ${JSON.stringify(silences.slice(0, 15))}`
     : 'No silence intervals detected by server audio analyzer.';
 
-  const sceneSummary = Array.isArray(options.sceneCuts) && options.sceneCuts.length
-    ? 'FFmpeg visual cut candidates in first ' + Number(options.sceneCoverageSeconds || 0).toFixed(1) +
-      ' seconds (timestamps): ' + options.sceneCuts.slice(0, 50).map(t => Number(t).toFixed(2)).join(', ') +
-      '. These indicate shot boundaries only, NOT content quality or speech.'
-    : 'No reliable FFmpeg visual scene cuts detected in the sampled interval (' +
-      Number(options.sceneCoverageSeconds || 0).toFixed(1) + ' seconds). This does NOT mean the full video has no cuts.';
+  const sceneSummary = (options.sceneCoverageSeconds || 0) <= 0
+    ? 'Visual scene analysis was unavailable or timed out. No scene-change evidence was measured.'
+    : Array.isArray(options.sceneCuts) && options.sceneCuts.length > 0
+      ? 'FFmpeg visual cut candidates in first ' + Number(options.sceneCoverageSeconds).toFixed(1) +
+        ' seconds (timestamps): ' + options.sceneCuts.slice(0, 50).map(t => Number(t).toFixed(2)).join(', ') +
+        '. These indicate shot boundaries only, NOT content quality or speech.'
+      : 'FFmpeg sampled first ' + Number(options.sceneCoverageSeconds).toFixed(1) +
+        ' seconds without detecting reliable scene transitions. No inference is possible for unsampled content.';
 
   const systemPrompt = `You are an expert Hollywood and Viral Video Editor (AI Auto Video Editor).
 Your job is to analyze the user's video, understand its semantic moments, speech, flow, and visual interest, then produce an EDIT PLAN JSON strictly adhering to the schema.
