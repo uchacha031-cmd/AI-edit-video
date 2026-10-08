@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs/promises';
 import { VideoMetadata, SilenceInterval } from '../src/types/editor.js';
 import { SERVER_CONFIG } from './config.js';
+import { cleanSceneCuts } from './editing.js';
 
 /**
  * Execute ffprobe to extract accurate video and audio metadata.
@@ -90,52 +91,97 @@ export async function extractMediaMetadata(filePath: string): Promise<VideoMetad
  * Detect silence intervals using ffmpeg silencedetect filter.
  * Returns array of { start, end, duration } in seconds.
  */
+export function parseSilencedetectLog(log: string, sourceDurationSec?: number): SilenceInterval[] {
+  const intervals: SilenceInterval[] = [];
+  const events = /silence_(start|end):\s*(\d+(?:\.\d+)?)/g;
+  let match: RegExpExecArray | null;
+  let activeStart: number | null = null;
+  while ((match = events.exec(log))) {
+    const t = Number(match[2]);
+    if (!Number.isFinite(t)) continue;
+    if (match[1] === 'start') {
+      if (activeStart === null) activeStart = t;
+    } else if (activeStart !== null && t > activeStart) {
+      intervals.push({ start: activeStart, end: t, duration: t - activeStart });
+      activeStart = null;
+    }
+  }
+  // FFmpeg can omit silence_end when the source ends during silence.
+  if (activeStart !== null && Number.isFinite(sourceDurationSec) && sourceDurationSec! > activeStart) {
+    intervals.push({ start: activeStart, end: sourceDurationSec!, duration: sourceDurationSec! - activeStart });
+  }
+  return intervals.map(x => ({
+    start: Math.round(x.start * 1000) / 1000,
+    end: Math.round(x.end * 1000) / 1000,
+    duration: Math.round(x.duration * 1000) / 1000,
+  }));
+}
+
 export async function detectSilence(
   filePath: string,
   noiseDb = -30,
-  minDurationSec = 0.5
+  minDurationSec = 0.5,
+  sourceDurationSec?: number
 ): Promise<SilenceInterval[]> {
   return new Promise((resolve) => {
+    const db = Number.isFinite(noiseDb) ? Math.max(-80, Math.min(-5, noiseDb)) : -30;
+    const seconds = Number.isFinite(minDurationSec) ? Math.max(0.1, Math.min(10, minDurationSec)) : 0.5;
     const proc = spawn('ffmpeg', [
-      '-i', filePath,
-      '-af', `silencedetect=noise=${noiseDb}dB:d=${minDurationSec}`,
-      '-f', 'null',
-      '-',
+      '-hide_banner', '-nostats', '-loglevel', 'info', '-i', filePath,
+      '-af', 'silencedetect=noise=' + db + 'dB:d=' + seconds,
+      '-f', 'null', '-',
     ]);
-
-    let stderr = '';
-    proc.stderr.on('data', (d) => { stderr += d.toString(); });
-
-    proc.on('close', () => {
-      const intervals: SilenceInterval[] = [];
-      const silenceStartRegex = /silence_start:\s*([0-9.]+)/g;
-      const silenceEndRegex = /silence_end:\s*([0-9.]+)\s*\|\s*silence_duration:\s*([0-9.]+)/g;
-
-      const starts: number[] = [];
-      let match;
-
-      while ((match = silenceStartRegex.exec(stderr)) !== null) {
-        starts.push(parseFloat(match[1]));
-      }
-
-      let endIdx = 0;
-      while ((match = silenceEndRegex.exec(stderr)) !== null) {
-        const end = parseFloat(match[1]);
-        const dur = parseFloat(match[2]);
-        const start = starts[endIdx] !== undefined ? starts[endIdx] : Math.max(0, end - dur);
-        intervals.push({
-          start: Math.round(start * 100) / 100,
-          end: Math.round(end * 100) / 100,
-          duration: Math.round(dur * 100) / 100,
-        });
-        endIdx++;
-      }
-
-      resolve(intervals);
+    let log = '';
+    let settled = false;
+    const finish = (result: SilenceInterval[]) => { if (!settled) { settled = true; resolve(result); } };
+    proc.stderr.on('data', chunk => {
+      log += String(chunk);
+      if (log.length > 512_000) log = log.slice(-512_000);
     });
+    proc.on('error', () => finish([]));
+    proc.on('close', code => finish(code === 0 ? parseSilencedetectLog(log, sourceDurationSec) : []));
+  });
+}
 
-    proc.on('error', () => {
-      resolve([]);
+/**
+ * FFmpeg scene-change candidates based on visual frame differences.
+ * Inspired by PySceneDetect's content-adaptive approach, but intentionally
+ * independent and non-AI. Time-window coverage is explicit.
+ */
+export async function detectSceneChanges(
+  filePath: string,
+  sourceDurationSec: number,
+  limitSeconds = 120,
+): Promise<{ timestamps: number[]; analyzedSeconds: number }> {
+  const analyzedSeconds = Math.min(sourceDurationSec, limitSeconds);
+  if (!Number.isFinite(analyzedSeconds) || analyzedSeconds < 1) return { timestamps: [], analyzedSeconds: 0 };
+  return new Promise(resolve => {
+    const args = [
+      '-hide_banner', '-nostats', '-loglevel', 'info', '-i', filePath,
+      '-t', String(analyzedSeconds),
+      '-vf', 'fps=3,scale=256:-2,select=gt(scene\\,0.28),showinfo',
+      '-an', '-f', 'null', '-',
+    ];
+    const proc = spawn('ffmpeg', args);
+    let log = '';
+    let settled = false;
+    const timer = setTimeout(() => { proc.kill('SIGKILL'); }, 15_000);
+    timer.unref();
+    const finish = (result: number[]) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ timestamps: result, analyzedSeconds });
+    };
+    proc.stderr.on('data', chunk => {
+      log += String(chunk);
+      if (log.length > 512_000) log = log.slice(-512_000);
+    });
+    proc.on('error', () => finish([]));
+    proc.on('close', code => {
+      if (code !== 0) return finish([]);
+      const matches = [...log.matchAll(/Parsed_showinfo[^\n]*pts_time:\s*([0-9.]+)/g)];
+      finish(cleanSceneCuts(matches.map(m => Number(m[1])), analyzedSeconds));
     });
   });
 }
