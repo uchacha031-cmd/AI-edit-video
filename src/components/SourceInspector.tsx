@@ -99,7 +99,7 @@ export const SourceInspector: React.FC<SourceInspectorProps> = ({
             <Radio className="w-3.5 h-3.5 text-indigo-400" />
             <span className="text-slate-300 font-medium">Phân tích khoảng lặng máy chủ:</span>
             <span className="text-slate-400">
-              Phát hiện <strong className="text-slate-200">{silences.length}</strong> khoảng dừng (Tổng cộng {totalSilenceDuration.toFixed(1)}s có thể cắt)
+              Phát hiện <strong className="text-slate-200">{silences.length}</strong> khoảng lặng ({totalSilenceDuration.toFixed(1)}s được đo; chỉ cắt các đoạn đủ dài, có chừa biên bảo vệ lời nói)
             </span>
           </div>
           {silences.length > 0 && (
