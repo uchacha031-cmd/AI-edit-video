@@ -41,8 +41,9 @@ async function waitReady() {
   const badMedia = await fetch(base + '/api/media/upload/secret.env');
   assert.equal(badMedia.status, 404);
   console.log('PASS HTTP rejects unrecognized media filenames');
-  const badRender = await fetch(base + '/api/render-progress/../../../secret');
-  assert.equal(badRender.status, 404);
+  // Encode path separators so URL normalization cannot rewrite the test route.
+  const badRender = await fetch(base + '/api/render-progress/%2E%2E%2Fsecret');
+  assert.equal(badRender.status, 400);
   const badId = await fetch(base + '/api/render-progress/invalid');
   assert.equal(badId.status, 400);
   console.log('PASS HTTP rejects unrecognized render IDs');
