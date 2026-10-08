@@ -1,0 +1,8 @@
+{
+  "name": "AI Auto Video Editor",
+  "description": "Tự động phân tích video bằng Gemini AI, trích xuất highlight, cắt ghép thông minh, xóa silence và render video MP4 hoàn chỉnh bằng FFmpeg.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
