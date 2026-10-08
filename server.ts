@@ -117,6 +117,24 @@ app.get('/api/health', (_req: Request, res: Response) => {
   });
 });
 
+type RenderProgress = { percent: number; status: 'rendering' | 'completed' | 'cancelled' | 'error' };
+const renderProgress = new Map<string, RenderProgress>();
+function updateRenderProgress(id: string, state: RenderProgress): void {
+  renderProgress.set(id, state);
+  if (state.status !== 'rendering') {
+    const cleanup = setTimeout(() => { if (renderProgress.get(id) === state) renderProgress.delete(id); }, 60_000);
+    cleanup.unref();
+  }
+}
+app.get('/api/render-progress/:renderId', (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const id = req.params.renderId;
+  if (!/^render_[0-9a-z_-]{12,80}$/i.test(id)) return res.status(400).json({ success: false });
+  const value = renderProgress.get(id);
+  if (!value) return res.status(404).json({ success: false, error: 'Render not active' });
+  res.json({ success: true, ...value });
+});
+
 // ================= API ENDPOINTS ================= //
 
 /**
@@ -328,9 +346,15 @@ app.post('/api/render', async (req: Request, res: Response) => {
     if (typeof renderId !== 'string' || !/^render_[0-9a-z_-]{12,80}$/i.test(renderId)) {
       return res.status(400).json({ success: false, error: 'Invalid render ID' });
     }
+    if (renderProgress.get(renderId)?.status === 'rendering') {
+      return res.status(409).json({ success: false, error: 'Render ID is already active' });
+    }
+    updateRenderProgress(renderId, { status: 'rendering', percent: 0 });
     const result = await renderEditPlan(filePath, validation.sanitizedPlan, renderId, {
       burnSubtitles: burnSubtitles !== false,
+      onProgress: (value) => updateRenderProgress(renderId, { status: 'rendering', percent: value }),
     });
+    updateRenderProgress(renderId, { status: 'completed', percent: 100 });
 
     res.json({
       success: true,
@@ -338,6 +362,10 @@ app.post('/api/render', async (req: Request, res: Response) => {
       result,
     });
   } catch (err: any) {
+    const id = req.body?.renderId;
+    if (typeof id === 'string' && /^render_[0-9a-z_-]{12,80}$/i.test(id)) {
+      updateRenderProgress(id, { status: String(err?.message || '').includes('cancelled') ? 'cancelled' : 'error', percent: 0 });
+    }
     console.error('Render error:', err);
     res.status(500).json({ error: err.message || 'Render process failed' });
   }
@@ -352,6 +380,7 @@ app.post('/api/cancel-render', (req: Request, res: Response) => {
     return res.status(400).json({ error: 'Invalid renderId' });
   }
   const cancelled = cancelRender(renderId);
+  updateRenderProgress(renderId, { status: 'cancelled', percent: 0 });
   res.json({ success: cancelled });
 });
 
