@@ -35,3 +35,5 @@ jobs:
         run: npm test
       - name: Smoke-test HTTP API
         run: node tests/http.cjs
+      - name: Validate browser download payloads
+        run: node tests/download.cjs
