@@ -26,13 +26,17 @@ export function validateAndSanitizeEditPlan(
     };
   }
 
+  if (!sourceMeta || !Number.isFinite(sourceMeta.duration) || sourceMeta.duration <= 0) {
+    return { valid: false, sanitizedPlan: null as any, errors: ['Metadata video nguồn không hợp lệ.'], warnings: [] };
+  }
   const sourceDuration = sourceMeta.duration;
 
   // 1. Sanitize project & source
   const project = {
     title: String(rawPlan.project?.title || 'Dự án dựng tự động').trim(),
     sourceDuration: Number(sourceDuration.toFixed(2)),
-    targetDuration: Math.max(5, Number(rawPlan.project?.targetDuration || 30)),
+    targetDuration: Number.isFinite(Number(rawPlan.project?.targetDuration)) && Number(rawPlan.project.targetDuration) > 0
+      ? Math.min(sourceDuration, Number(rawPlan.project.targetDuration)) : Math.min(30, sourceDuration),
     preset: String(rawPlan.project?.preset || 'Fast TikTok'),
     prompt: rawPlan.project?.prompt ? String(rawPlan.project.prompt) : undefined,
   };
@@ -56,7 +60,7 @@ export function validateAndSanitizeEditPlan(
     let start = Number(s.sourceStart);
     let end = Number(s.sourceEnd);
 
-    if (isNaN(start) || isNaN(end)) {
+    if (!Number.isFinite(start) || !Number.isFinite(end)) {
       warnings.push(`Phân đoạn #${i + 1} có mốc thời gian không hợp lệ; đã bỏ qua.`);
       continue;
     }
@@ -90,7 +94,7 @@ export function validateAndSanitizeEditPlan(
     if (s.focalPoint && typeof s.focalPoint === 'object') {
       const fx = Number(s.focalPoint.x);
       const fy = Number(s.focalPoint.y);
-      if (!isNaN(fx) && !isNaN(fy)) {
+      if (Number.isFinite(fx) && Number.isFinite(fy)) {
         focalPoint = {
           x: Math.max(0, Math.min(1, fx)),
           y: Math.max(0, Math.min(1, fy)),
@@ -128,16 +132,11 @@ export function validateAndSanitizeEditPlan(
     });
   }
 
-  // Sort segments by start time
-  validSegments.sort((a, b) => a.sourceStart - b.sourceStart);
-
-  // Resolve overlaps between consecutive kept segments
-  for (let i = 0; i < validSegments.length - 1; i++) {
-    const curr = validSegments[i];
-    const next = validSegments[i + 1];
-    if (curr.sourceEnd > next.sourceStart) {
-      warnings.push(`Đã tự động điều chỉnh điểm chồng lấn giữa đoạn ${curr.id} và ${next.id}.`);
-      curr.sourceEnd = Number(Math.max(curr.sourceStart + 0.2, next.sourceStart).toFixed(2));
+  // Preserve the editor's ordering; source overlaps may be intentional.
+  for (let i = 1; i < validSegments.length; i++) {
+    if (validSegments[i].sourceStart < validSegments[i - 1].sourceEnd) {
+      warnings.push('Các đoạn nguồn có thể chồng lấn hoặc đảo thứ tự; giữ nguyên thứ tự dựng do người dùng chọn.');
+      break;
     }
   }
 
@@ -171,7 +170,7 @@ export function validateAndSanitizeEditPlan(
     let end = Number(sub.end);
     const text = String(sub.text || '').trim();
 
-    if (isNaN(start) || isNaN(end) || !text) continue;
+    if (!Number.isFinite(start) || !Number.isFinite(end) || !text) continue;
 
     start = Math.max(0, Math.min(start, sourceDuration));
     end = Math.max(0, Math.min(end, sourceDuration));
@@ -248,7 +247,7 @@ export function validateAndSanitizeEditPlan(
     effects,
     audio,
     export: exportConfig,
-    warnings: Array.from(new Set([...(rawPlan.warnings || []), ...warnings])),
+    warnings: Array.from(new Set([...(Array.isArray(rawPlan.warnings) ? rawPlan.warnings.slice(0, 50).map(String) : []), ...warnings])),
   };
 
   return {

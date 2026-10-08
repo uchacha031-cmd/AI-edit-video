@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { Film, Sparkles, RefreshCw, AlertCircle, Video, Download } from 'lucide-react';
 import { AppProcessStatus, VideoMetadata } from '../types/editor';
 
@@ -17,6 +17,7 @@ export const Header: React.FC<HeaderProps> = ({
   onReset,
   onSelectSample,
 }) => {
+  const [isSampleMenuOpen, setIsSampleMenuOpen] = useState(false);
   const getStatusBadge = () => {
     switch (status) {
       case 'idle':
@@ -80,14 +81,16 @@ export const Header: React.FC<HeaderProps> = ({
               type="button"
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition"
               title="Dùng thử ngay bằng video mẫu tích hợp sẵn"
+              aria-expanded={isSampleMenuOpen}
+              onClick={() => setIsSampleMenuOpen((open) => !open)}
             >
               <Video className="w-3.5 h-3.5 text-indigo-400" />
               <span>Dùng video mẫu</span>
             </button>
-            <div className="absolute right-0 mt-1 w-60 rounded-lg bg-slate-800 border border-slate-700 shadow-xl py-1 hidden group-hover:block z-50">
+            <div className={'absolute right-0 mt-1 w-60 rounded-lg bg-slate-800 border border-slate-700 shadow-xl py-1 z-50 ' + (isSampleMenuOpen ? 'block' : 'hidden group-hover:block')}>
               <button
                 type="button"
-                onClick={() => onSelectSample('talking_head')}
+                onClick={() => { setIsSampleMenuOpen(false); onSelectSample('talking_head'); }}
                 className="w-full text-left px-3 py-2 text-xs text-slate-200 hover:bg-indigo-600 hover:text-white transition flex flex-col"
               >
                 <span className="font-medium">Video chân dung (Dọc 9:16)</span>
@@ -95,7 +98,7 @@ export const Header: React.FC<HeaderProps> = ({
               </button>
               <button
                 type="button"
-                onClick={() => onSelectSample('landscape_demo')}
+                onClick={() => { setIsSampleMenuOpen(false); onSelectSample('landscape_demo'); }}
                 className="w-full text-left px-3 py-2 text-xs text-slate-200 hover:bg-indigo-600 hover:text-white transition flex flex-col border-t border-slate-700/50"
               >
                 <span className="font-medium">Video phong cảnh (Ngang 16:9)</span>
@@ -103,7 +106,7 @@ export const Header: React.FC<HeaderProps> = ({
               </button>
               <button
                 type="button"
-                onClick={() => onSelectSample('no_audio')}
+                onClick={() => { setIsSampleMenuOpen(false); onSelectSample('no_audio'); }}
                 className="w-full text-left px-3 py-2 text-xs text-slate-200 hover:bg-indigo-600 hover:text-white transition flex flex-col border-t border-slate-700/50"
               >
                 <span className="font-medium">Video không có tiếng (Vuông 1:1)</span>

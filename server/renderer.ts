@@ -7,6 +7,7 @@ import { extractMediaMetadata } from './media.js';
 
 // Active render processes for cancellation support
 const activeRenders = new Map<string, ChildProcess>();
+const cancelledRenders = new Set<string>();
 
 /**
  * Format seconds to SRT timestamp: HH:MM:SS,mmm
@@ -26,58 +27,38 @@ function formatSrtTimestamp(seconds: number): string {
  * Subtitle timestamps are mapped to the new edited timeline!
  */
 export function generateSrtContent(subtitles: EditSubtitle[], keptSegments: { sourceStart: number; sourceEnd: number }[]): string {
-  if (!subtitles || subtitles.length === 0) return '';
-
-  let srt = '';
-  let count = 1;
-
-  // Map source timestamps into new concatenated timeline
-  for (const sub of subtitles) {
-    let mappedStart: number | null = null;
-    let mappedEnd: number | null = null;
-    let elapsed = 0;
-
-    for (const seg of keptSegments) {
-      const segDur = seg.sourceEnd - seg.sourceStart;
-      
-      // Check if subtitle overlaps with kept segment
-      if (sub.end > seg.sourceStart && sub.start < seg.sourceEnd) {
-        const segOverlapStart = Math.max(sub.start, seg.sourceStart);
-        const segOverlapEnd = Math.min(sub.end, seg.sourceEnd);
-        
-        const subRelativeStart = elapsed + (segOverlapStart - seg.sourceStart);
-        const subRelativeEnd = elapsed + (segOverlapEnd - seg.sourceStart);
-
-        if (mappedStart === null || subRelativeStart < mappedStart) {
-          mappedStart = subRelativeStart;
-        }
-        mappedEnd = subRelativeEnd;
+  if (!Array.isArray(subtitles) || subtitles.length === 0) return '';
+  const cues: { start: number; end: number; text: string }[] = [];
+  let elapsed = 0;
+  for (const seg of keptSegments) {
+    const duration = seg.sourceEnd - seg.sourceStart;
+    if (!Number.isFinite(duration) || duration <= 0) continue;
+    for (const sub of subtitles) {
+      if (!sub.text?.trim()) continue;
+      const start = Math.max(seg.sourceStart, sub.start);
+      const end = Math.min(seg.sourceEnd, sub.end);
+      if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
+        cues.push({ start: elapsed + start - seg.sourceStart, end: elapsed + end - seg.sourceStart, text: sub.text.replace(/\r/g, '').trim() });
       }
-      elapsed += segDur;
     }
-
-    if (mappedStart !== null && mappedEnd !== null && mappedEnd > mappedStart) {
-      srt += `${count}\n`;
-      srt += `${formatSrtTimestamp(mappedStart)} --> ${formatSrtTimestamp(mappedEnd)}\n`;
-      srt += `${sub.text}\n\n`;
-      count++;
-    }
+    elapsed += duration;
   }
-
-  return srt;
+  cues.sort((a, b) => a.start - b.start || a.end - b.end);
+  return cues.map((cue, i) =>
+    String(i + 1) + '\n' + formatSrtTimestamp(cue.start) + ' --> ' + formatSrtTimestamp(cue.end) + '\n' + cue.text + '\n'
+  ).join('\n');
 }
 
 /**
  * Cancel an ongoing render by renderId
  */
 export function cancelRender(renderId: string): boolean {
+  cancelledRenders.add(renderId);
+  const cleanup = setTimeout(() => cancelledRenders.delete(renderId), 5 * 60_000);
+  cleanup.unref();
   const proc = activeRenders.get(renderId);
-  if (proc) {
-    proc.kill('SIGKILL');
-    activeRenders.delete(renderId);
-    return true;
-  }
-  return false;
+  if (proc) proc.kill('SIGKILL');
+  return true;
 }
 
 /**
@@ -112,6 +93,8 @@ export async function renderEditPlan(
     if (keptSegments.length === 0) {
       throw new Error('Cannot render: No segments are marked to keep.');
     }
+
+    if (cancelledRenders.has(renderId)) throw new Error('Render cancelled by user');
 
     // 1. Determine target dimensions
     const aspect = plan.export.aspectRatio || '9:16';
@@ -247,6 +230,7 @@ export async function renderEditPlan(
 
     // 5. Execute render with child_process
     await new Promise<void>((resolve, reject) => {
+      if (cancelledRenders.has(renderId)) { reject(new Error('Render cancelled by user')); return; }
       const proc = spawn('ffmpeg', ffmpegArgs);
       activeRenders.set(renderId, proc);
 
@@ -268,7 +252,8 @@ export async function renderEditPlan(
 
       proc.on('close', (code) => {
         activeRenders.delete(renderId);
-        if (code === 0) {
+        if (cancelledRenders.has(renderId)) { reject(new Error('Render cancelled by user')); }
+        else if (code === 0) {
           resolve();
         } else {
           reject(new Error(`FFmpeg render process failed with code ${code}: ${stderr.slice(-600)}`));
@@ -304,8 +289,10 @@ export async function renderEditPlan(
         onProgress: options?.onProgress,
       });
     }
+    await fs.rm(outputPath, { force: true }).catch(() => {});
     throw err;
   } finally {
+    cancelledRenders.delete(renderId);
     // Cleanup temporary job directory
     try {
       await fs.rm(tempJobDir, { recursive: true, force: true });

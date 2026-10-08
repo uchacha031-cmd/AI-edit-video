@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import {
   AppProcessStatus,
   AspectRatio,
@@ -62,7 +62,8 @@ export default function App() {
   // Render & Export state
   const [isExportModalOpen, setIsExportModalOpen] = useState(false);
   const [renderResult, setRenderResult] = useState<RenderResult | null>(null);
-  const [activeRenderId, setActiveRenderId] = useState<string | null>(null);
+  const activeRenderIdRef = useRef<string | null>(null);
+  const cancelledRenderIdRef = useRef<string | null>(null);
 
   // 1. Upload Video File
   const handleFileUpload = async (file: File) => {
@@ -203,6 +204,29 @@ export default function App() {
     }
   };
 
+  // Optional rule-based fallback; user must choose it explicitly.
+  const handleOfflinePlan = async () => {
+    if (!videoId) return;
+    setStatus('planning');
+    setErrorMessage('');
+    try {
+      const { ok, data } = await fetchApiJson('/api/offline-plan', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ videoId, preset: selectedPreset, targetDuration }),
+      });
+      if (!ok || !data?.success) throw new Error(data?.error || 'Không thể tạo bản dựng cơ bản');
+      setPlan(data.plan);
+      setQualityCheck(null);
+      setSelectedSegmentId(data.plan.segments?.[0]?.id || null);
+      setStatus('idle');
+      setStatusMessage('Đã tạo kế hoạch cắt khoảng lặng cơ bản. Không có phân tích Gemini hoặc phụ đề AI.');
+      setAiNotice({ userMessage: 'Chế độ cơ bản: cắt khoảng lặng bằng FFmpeg, không nhận diện cảnh đẹp, lời nói hay highlight bằng AI.' });
+    } catch (err: any) {
+      setStatus('error');
+      setErrorMessage(err.message || 'Lỗi tạo kế hoạch cơ bản');
+    }
+  };
+
   // 4. Natural Language Edit Command
   const handleApplyNaturalLanguageCommand = async (command: string) => {
     if (!plan || !videoId) return;
@@ -261,7 +285,6 @@ export default function App() {
   const handleUpdateSegment = (updated: EditSegment) => {
     if (!plan) return;
     const newSegs = plan.segments.map((s) => (s.id === updated.id ? updated : s));
-    newSegs.sort((a, b) => a.sourceStart - b.sourceStart);
     setPlan(recalculatePlanDuration({ ...plan, segments: newSegs }));
   };
 
@@ -270,7 +293,6 @@ export default function App() {
     const newSegs = plan.segments.map((s) =>
       s.id === id ? { ...s, sourceStart: start, sourceEnd: end } : s
     );
-    newSegs.sort((a, b) => a.sourceStart - b.sourceStart);
     setPlan(recalculatePlanDuration({ ...plan, segments: newSegs }));
   };
 
@@ -342,6 +364,10 @@ export default function App() {
     setStatusMessage('Máy chủ FFmpeg đang dựng video MP4...');
     setErrorMessage('');
     setIsExportModalOpen(true);
+    setRenderResult(null);
+    const jobId = 'render_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 14);
+    activeRenderIdRef.current = jobId;
+    cancelledRenderIdRef.current = null;
 
     try {
       const { ok, data } = await fetchApiJson('/api/render', {
@@ -351,6 +377,7 @@ export default function App() {
           plan,
           videoId,
           burnSubtitles,
+          renderId: jobId,
         }),
       });
 
@@ -358,33 +385,40 @@ export default function App() {
         throw new Error(data?.error || 'Dựng video thất bại');
       }
 
+      if (cancelledRenderIdRef.current === jobId) return;
       setRenderResult(data.result);
-      setActiveRenderId(data.renderId);
       setStatus('completed');
       setStatusMessage('Quá trình dựng video MP4 đã hoàn tất thành công.');
     } catch (err: any) {
+      if (cancelledRenderIdRef.current === jobId) return;
       console.error(err);
       setStatus('error');
       setErrorMessage(err.message || 'Dựng video thất bại');
+    } finally {
+      if (activeRenderIdRef.current === jobId) activeRenderIdRef.current = null;
     }
   };
 
   const handleCancelRender = async () => {
-    if (!activeRenderId) return;
+    const jobId = activeRenderIdRef.current;
+    if (!jobId) return;
+    cancelledRenderIdRef.current = jobId;
+    setStatus('idle');
+    setStatusMessage('Đã gửi yêu cầu hủy dựng video.');
+    setIsExportModalOpen(false);
     try {
       await fetchApiJson('/api/cancel-render', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ renderId: activeRenderId }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ renderId: jobId }),
       });
-      setStatus('idle');
-      setIsExportModalOpen(false);
     } catch (err) {
-      console.error(err);
+      console.error('Không thể xác nhận hủy render:', err);
+      setErrorMessage('Không kết nối được máy chủ để hủy render. Hãy kiểm tra trạng thái máy chủ.');
     }
   };
 
   const handleReset = () => {
+    if (activeRenderIdRef.current) void handleCancelRender();
     setVideoId(null);
     setSourceUrl(null);
     setMetadata(null);
@@ -415,6 +449,12 @@ export default function App() {
       {/* Main Workspace */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-3 md:p-6 space-y-4">
         {/* Error Notification Banner with Vietnamese Collapsible Details */}
+        {errorMessage && videoId && !plan && (
+          <button type="button" onClick={handleOfflinePlan}
+            className="px-4 py-2 rounded-lg bg-amber-700 hover:bg-amber-600 text-white text-sm font-semibold">
+            Tiếp tục không cần Gemini (cắt khoảng lặng cơ bản)
+          </button>
+        )}
         {errorMessage && (
           <ErrorNotice
             error={errorMessage}

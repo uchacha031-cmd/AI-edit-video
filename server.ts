@@ -6,7 +6,7 @@ import fsSync from 'fs';
 import { createServer as createViteServer } from 'vite';
 import { SERVER_CONFIG, ensureStorageDirectories } from './server/config.js';
 import { extractMediaMetadata, detectSilence, extractThumbnails } from './server/media.js';
-import { generateEditPlanWithGemini, modifyPlanWithNaturalLanguage } from './server/gemini.js';
+import { generateEditPlanWithGemini, modifyPlanWithNaturalLanguage, buildDeterministicPlan } from './server/gemini.js';
 import { renderEditPlan, cancelRender } from './server/renderer.js';
 import { getOrCreateSampleVideo } from './server/sampleVideo.js';
 import { validateAndSanitizeEditPlan } from './server/validator.js';
@@ -25,7 +25,8 @@ await ensureStorageDirectories();
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, SERVER_CONFIG.UPLOAD_DIR),
   filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname) || '.mp4';
+    const rawExt = path.extname(file.originalname).toLowerCase();
+    const ext = /^\.[a-z0-9]{2,6}$/.test(rawExt) ? rawExt : '.mp4';
     const unique = `${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
     cb(null, `upload_${unique}${ext}`);
   },
@@ -55,19 +56,24 @@ function streamMediaFile(req: Request, res: Response, filePath: string, contentT
     const range = req.headers.range;
 
     if (range) {
-      const parts = range.replace(/bytes=/, '').split('-');
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
+      const match = /^bytes=(\d+)-(\d*)$/.exec(range);
+      const start = match ? Number(match[1]) : NaN;
+      const end = match && match[2] ? Number(match[2]) : stat.size - 1;
+      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start || stat.size === 0) {
+        res.status(416).setHeader('Content-Range', 'bytes */' + stat.size).end();
+        return;
+      }
+      const safeEnd = Math.min(end, stat.size - 1);
 
       if (start >= stat.size) {
         res.status(416).setHeader('Content-Range', `bytes */${stat.size}`).end();
         return;
       }
 
-      const chunksize = end - start + 1;
-      const file = fsSync.createReadStream(filePath, { start, end });
+      const chunksize = safeEnd - start + 1;
+      const file = fsSync.createReadStream(filePath, { start, end: safeEnd });
       res.writeHead(206, {
-        'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+        'Content-Range': `bytes ${start}-${safeEnd}/${stat.size}`,
         'Accept-Ranges': 'bytes',
         'Content-Length': chunksize,
         'Content-Type': contentType,
@@ -87,6 +93,17 @@ function streamMediaFile(req: Request, res: Response, filePath: string, contentT
   }
 }
 
+// Accept only app-generated IDs, never arbitrary file paths.
+function resolveSourceFile(videoId: unknown): string | null {
+  if (typeof videoId !== 'string' ||
+      !/^(upload_\d+_[a-z0-9]{5,12}\.[a-z0-9]{2,6}|sample_(talking_head|landscape_demo|no_audio)\.mp4)$/i.test(videoId)) {
+    return null;
+  }
+  const dir = videoId.startsWith('sample_') ? SERVER_CONFIG.SAMPLES_DIR : SERVER_CONFIG.UPLOAD_DIR;
+  const resolved = path.resolve(dir, videoId);
+  return fsSync.existsSync(resolved) ? resolved : null;
+}
+
 // ================= API ENDPOINTS ================= //
 
 /**
@@ -103,6 +120,10 @@ app.post('/api/upload', upload.single('video'), async (req: Request, res: Respon
 
     // 1. Technical metadata via ffprobe
     const metadata = await extractMediaMetadata(filePath);
+    if (metadata.duration > SERVER_CONFIG.MAX_SOURCE_DURATION_SEC) {
+      await fs.unlink(filePath).catch(() => {});
+      return res.status(413).json({ success: false, error: 'Video dài hơn giới hạn 10 phút của ứng dụng.' });
+    }
 
     // 2. Silence detection via ffmpeg
     const silences = metadata.hasAudio ? await detectSilence(filePath) : [];
@@ -114,7 +135,6 @@ app.post('/api/upload', upload.single('video'), async (req: Request, res: Respon
       success: true,
       videoId: filename,
       mediaUrl: `/api/media/upload/${filename}`,
-      filePath,
       metadata,
       silences,
       thumbnails,
@@ -142,7 +162,6 @@ app.post('/api/sample', async (req: Request, res: Response) => {
       success: true,
       videoId: filename,
       mediaUrl: `/api/media/sample/${filename}`,
-      filePath,
       metadata,
       silences,
       thumbnails,
@@ -150,6 +169,26 @@ app.post('/api/sample', async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error('Sample generation error:', err);
     res.status(500).json({ error: err.message || 'Failed to load sample video' });
+  }
+});
+
+/**
+ * POST /api/offline-plan - Rule-based edit plan, not Gemini analysis.
+ */
+app.post('/api/offline-plan', async (req: Request, res: Response) => {
+  try {
+    const filePath = resolveSourceFile(req.body?.videoId);
+    if (!filePath) return res.status(404).json({ success: false, error: 'Video nguồn không tồn tại' });
+    const metadata = await extractMediaMetadata(filePath);
+    const silences = metadata.hasAudio ? await detectSilence(filePath) : [];
+    const preset = typeof req.body.preset === 'string' ? req.body.preset.slice(0, 60) : 'Clean Minimal';
+    const duration = Math.min(metadata.duration, Math.max(1, Number(req.body.targetDuration) || 30));
+    const plan = buildDeterministicPlan(metadata, silences, preset, duration);
+    const validation = validateAndSanitizeEditPlan(plan, metadata);
+    if (!validation.valid) return res.status(422).json({ success: false, error: validation.errors.join('; ') });
+    res.json({ success: true, plan: validation.sanitizedPlan, mode: 'offline-rule-based' });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message || 'Không tạo được kế hoạch offline' });
   }
 });
 
@@ -163,12 +202,8 @@ app.post('/api/analyze', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Missing videoId' });
     }
 
-    // Determine path
-    let filePath = path.join(SERVER_CONFIG.UPLOAD_DIR, videoId);
-    if (!fsSync.existsSync(filePath)) {
-      filePath = path.join(SERVER_CONFIG.SAMPLES_DIR, videoId);
-    }
-    if (!fsSync.existsSync(filePath)) {
+    const filePath = resolveSourceFile(videoId);
+    if (!filePath) {
       return res.status(404).json({ error: 'Source video file not found' });
     }
 
@@ -220,19 +255,16 @@ app.post('/api/modify-plan', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Missing plan or command' });
     }
 
-    let filePath = path.join(SERVER_CONFIG.UPLOAD_DIR, videoId || plan.source?.filename);
-    if (!fsSync.existsSync(filePath)) {
-      filePath = path.join(SERVER_CONFIG.SAMPLES_DIR, videoId || plan.source?.filename);
-    }
-
-    const metadata = fsSync.existsSync(filePath)
-      ? await extractMediaMetadata(filePath)
-      : (plan.source as any);
+    const filePath = resolveSourceFile(videoId || plan.source?.filename);
+    if (!filePath) return res.status(404).json({ error: 'Source video file not found' });
+    const metadata = await extractMediaMetadata(filePath);
 
     const result = await modifyPlanWithNaturalLanguage(plan, metadata, command);
+    const validation = validateAndSanitizeEditPlan(result.plan, metadata);
+    if (!validation.valid) return res.status(422).json({ error: validation.errors.join('; ') });
     res.json({
       success: true,
-      plan: result.plan,
+      plan: validation.sanitizedPlan,
       explanation: result.explanation,
     });
   } catch (err: any) {
@@ -247,13 +279,9 @@ app.post('/api/modify-plan', async (req: Request, res: Response) => {
 app.post('/api/validate-plan', async (req: Request, res: Response) => {
   try {
     const { plan, videoId } = req.body;
-    let filePath = path.join(SERVER_CONFIG.UPLOAD_DIR, videoId || plan.source?.filename);
-    if (!fsSync.existsSync(filePath)) {
-      filePath = path.join(SERVER_CONFIG.SAMPLES_DIR, videoId || plan.source?.filename);
-    }
-    const metadata = fsSync.existsSync(filePath)
-      ? await extractMediaMetadata(filePath)
-      : (plan.source as any);
+    const filePath = resolveSourceFile(videoId || plan?.source?.filename);
+    if (!filePath) return res.status(404).json({ valid: false, errors: ['Source video file not found'] });
+    const metadata = await extractMediaMetadata(filePath);
 
     const result = validateAndSanitizeEditPlan(plan, metadata);
     res.json(result);
@@ -267,21 +295,22 @@ app.post('/api/validate-plan', async (req: Request, res: Response) => {
  */
 app.post('/api/render', async (req: Request, res: Response) => {
   try {
-    const { plan, videoId, burnSubtitles } = req.body;
+    const { plan, videoId, burnSubtitles, renderId } = req.body;
     if (!plan || !videoId) {
       return res.status(400).json({ error: 'Missing plan or videoId' });
     }
 
-    let filePath = path.join(SERVER_CONFIG.UPLOAD_DIR, videoId);
-    if (!fsSync.existsSync(filePath)) {
-      filePath = path.join(SERVER_CONFIG.SAMPLES_DIR, videoId);
-    }
-    if (!fsSync.existsSync(filePath)) {
+    const filePath = resolveSourceFile(videoId);
+    if (!filePath) {
       return res.status(404).json({ error: 'Source video file not found for render' });
     }
 
-    const renderId = `${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-    const result = await renderEditPlan(filePath, plan, renderId, {
+    const validation = validateAndSanitizeEditPlan(plan, await extractMediaMetadata(filePath));
+    if (!validation.valid) return res.status(422).json({ success: false, error: validation.errors.join('; ') });
+    if (typeof renderId !== 'string' || !/^render_[0-9a-z_-]{12,80}$/i.test(renderId)) {
+      return res.status(400).json({ success: false, error: 'Invalid render ID' });
+    }
+    const result = await renderEditPlan(filePath, validation.sanitizedPlan, renderId, {
       burnSubtitles: burnSubtitles !== false,
     });
 
@@ -301,7 +330,9 @@ app.post('/api/render', async (req: Request, res: Response) => {
  */
 app.post('/api/cancel-render', (req: Request, res: Response) => {
   const { renderId } = req.body;
-  if (!renderId) return res.status(400).json({ error: 'Missing renderId' });
+  if (typeof renderId !== 'string' || !/^render_[0-9a-z_-]{12,80}$/i.test(renderId)) {
+    return res.status(400).json({ error: 'Invalid renderId' });
+  }
   const cancelled = cancelRender(renderId);
   res.json({ success: cancelled });
 });
