@@ -8,6 +8,7 @@ const root = path.resolve(__dirname,'..');
 const { buildConservativeEditTimeline, cleanSceneCuts } = require(path.join(root,'server/editing.ts'));
 const { parseSilencedetectLog, detectSceneChanges, extractMediaMetadata } = require(path.join(root,'server/media.ts'));
 const { validateAndSanitizeEditPlan } = require(path.join(root,'server/validator.ts'));
+const { buildDeterministicPlan } = require(path.join(root,'server/gemini.ts'));
 const approx = (actual, expected, delta=0.05) => assert.ok(Math.abs(actual-expected)<delta, actual+' vs '+expected);
 const pause = (start,end) => ({start,end,duration:end-start});
 
@@ -68,6 +69,13 @@ const pause = (start,end) => ({start,end,duration:end-start});
   assert.deepEqual(checked.sanitizedPlan.crop.focalPoint,{x:0.5,y:0.5});
   assert.equal(checked.sanitizedPlan.audio.volumeBoost,1);
   console.log('PASS invalid plan data cannot inject NaN into FFmpeg');
+  const integrated=buildDeterministicPlan({...meta,duration:12,aspectRatioLabel:'16:9'},[pause(3,4.1)],'Talking Head',5);
+  const actualCuts=integrated.segments.filter(s=>!s.keep);
+  assert.equal(actualCuts.length,1);
+  approx(actualCuts[0].sourceStart,3.18);
+  assert.ok(integrated.warnings.some(w=>w.includes('Không tự ý cắt bỏ lời nói')));
+  console.log('PASS offline-plan integration retains speech margins and transparently reports duration overflow');
+
 
 
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'ai-edit-scenes-'));
@@ -89,5 +97,5 @@ const pause = (start,end) => ({start,end,duration:end-start});
     console.log('PASS audio-only media cannot masquerade as a valid video');
   } finally {fs.rmSync(dir,{recursive:true,force:true});}
 
-  console.log('RESULT 11/11 EDITORIAL PASS');
+  console.log('RESULT 12/12 EDITORIAL PASS');
 })().catch(err=>{console.error(err);process.exitCode=1;});
