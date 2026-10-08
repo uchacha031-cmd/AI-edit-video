@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { RenderResult } from '../types/editor';
 import {
   Download,
@@ -9,6 +9,7 @@ import {
   Sparkles,
 } from 'lucide-react';
 import { ErrorNotice } from './ErrorNotice';
+import { downloadPreviewMedia, type DownloadKind } from '../utils/mediaDownload';
 
 interface ExportModalProps {
   isOpen: boolean;
@@ -31,6 +32,25 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   onCancelRender,
   onRetryRender,
 }) => {
+  const [downloading, setDownloading] = useState<DownloadKind | null>(null);
+  const [downloadError, setDownloadError] = useState('');
+
+  const handleDownload = async (kind: DownloadKind) => {
+    if (!renderResult || downloading) return;
+    const url = kind === 'mp4' ? renderResult.videoUrl : renderResult.srtUrl;
+    if (!url) return;
+    setDownloadError('');
+    setDownloading(kind);
+    try {
+      await downloadPreviewMedia(url, kind === 'mp4' ? renderResult.filename : 'phu_de.srt',
+        kind, kind === 'mp4' ? renderResult.sizeBytes : undefined);
+    } catch (err: unknown) {
+      setDownloadError(err instanceof Error ? err.message : 'Không thể tải tệp.');
+    } finally {
+      setDownloading(null);
+    }
+  };
+
   if (!isOpen) return null;
 
   const formatBytes = (bytes: number) => {
@@ -161,26 +181,30 @@ export const ExportModal: React.FC<ExportModalProps> = ({
 
             {/* Download Buttons */}
             <div className="flex flex-wrap items-center gap-2 pt-2">
-              <a
-                href={renderResult.videoUrl}
-                download={renderResult.filename}
+              <button
+                type="button"
+                onClick={() => void handleDownload('mp4')}
+                disabled={downloading !== null}
                 className="flex-1 py-2.5 px-4 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-semibold text-xs flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/20 transition"
               >
                 <Download className="w-4 h-4" />
-                <span>Tải video MP4 đã dựng</span>
-              </a>
+                <span>{downloading === 'mp4' ? 'Đang chuẩn bị MP4...' : 'Tải video MP4 đã dựng'}</span>
+              </button>
 
               {renderResult.srtUrl && (
-                <a
-                  href={renderResult.srtUrl}
-                  download="phu_de.srt"
+                <button
+                  type="button"
+                  onClick={() => void handleDownload('srt')}
+                  disabled={downloading !== null}
                   className="py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-750 text-slate-200 font-medium text-xs border border-slate-700 flex items-center gap-1.5 transition"
                 >
                   <Download className="w-3.5 h-3.5 text-indigo-400" />
-                  <span>Tải tệp .SRT</span>
-                </a>
+                  <span>{downloading === 'srt' ? 'Đang chuẩn bị SRT...' : 'Tải tệp .SRT'}</span>
+                </button>
               )}
             </div>
+            {downloadError && <p role="alert" className="text-xs text-rose-300 p-2 border border-rose-700 rounded-lg">{downloadError}</p>}
+            <p className="text-[11px] text-slate-400">Tải trực tiếp từ Preview, kiểm tra nội dung tệp trước khi lưu. Nếu nhận trang HTML xác thực, ứng dụng sẽ báo lỗi thay vì tải nhầm thành MP4.</p>
           </div>
         )}
       </div>
