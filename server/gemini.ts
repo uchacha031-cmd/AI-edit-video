@@ -492,6 +492,8 @@ export async function generateEditPlanWithGemini(
     targetDuration: number;
     userPrompt?: string;
     aspectRatio?: '9:16' | '16:9' | '1:1';
+    sceneCuts?: number[];
+    sceneCoverageSeconds?: number;
   }
 ): Promise<{
   success: boolean;
@@ -600,6 +602,13 @@ export async function generateEditPlanWithGemini(
     ? `FFmpeg detected ${silences.length} silence intervals: ${JSON.stringify(silences.slice(0, 15))}`
     : 'No silence intervals detected by server audio analyzer.';
 
+  const sceneSummary = Array.isArray(options.sceneCuts) && options.sceneCuts.length
+    ? 'FFmpeg visual cut candidates in first ' + Number(options.sceneCoverageSeconds || 0).toFixed(1) +
+      ' seconds (timestamps): ' + options.sceneCuts.slice(0, 50).map(t => Number(t).toFixed(2)).join(', ') +
+      '. These indicate shot boundaries only, NOT content quality or speech.'
+    : 'No reliable FFmpeg visual scene cuts detected in the sampled interval (' +
+      Number(options.sceneCoverageSeconds || 0).toFixed(1) + ' seconds). This does NOT mean the full video has no cuts.';
+
   const systemPrompt = `You are an expert Hollywood and Viral Video Editor (AI Auto Video Editor).
 Your job is to analyze the user's video, understand its semantic moments, speech, flow, and visual interest, then produce an EDIT PLAN JSON strictly adhering to the schema.
 
@@ -612,6 +621,7 @@ CRITICAL EDITORIAL PRINCIPLES:
 6. The target duration is approximately ${options.targetDuration} seconds.
 7. Subtitles: Transcribe the spoken words (in the original language, e.g. Vietnamese or English) with accurate start and end timestamps.
 8. Silence Guidance: ${silenceSummary}.
+8b. Visual cut evidence: ${sceneSummary}. Only source measurements are evidence; never invent details for unreviewed scenes.
 9. Preset selected: "${options.preset}".
 10. Target aspect ratio: "${options.aspectRatio || '9:16'}".
 ${options.userPrompt ? `USER SPECIAL INSTRUCTIONS: "${options.userPrompt}"` : ''}
