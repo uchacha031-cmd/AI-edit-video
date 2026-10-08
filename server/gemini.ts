@@ -706,6 +706,27 @@ Strictly output valid JSON matching the requested schema. Never output markdown 
   // If succeeded
   if (parsedJson) {
     const validation = validateAndSanitizeEditPlan(parsedJson, meta);
+    const noReliableSegments = !Array.isArray(parsedJson.segments) ||
+      validation.warnings.some(w => w.includes('Không có phân đoạn hợp lệ'));
+    if (!validation.valid || noReliableSegments) {
+      return {
+        success: false,
+        httpStatus: 422,
+        error: 'Gemini đã phản hồi nhưng kế hoạch biên tập không đủ hợp lệ để dùng. Vui lòng thử lại hoặc chọn chế độ cắt cơ bản.',
+        technicalDetails: [...validation.errors, ...validation.warnings].slice(0, 10).join('; '),
+        diagnostics: {
+          selectedModel: SERVER_CONFIG.GEMINI_MODEL,
+          videoFilename: meta.filename, videoSizeBytes: meta.filesize, videoDurationSec: meta.duration,
+          uploadStatus, geminiFileUri: geminiFile?.uri, geminiFileState: geminiFile?.state,
+          analysisAttempt: attemptNumber, maxAttempts, httpStatus: 422, requestStartTime,
+          requestEndTime, durationMs, totalRetryDelayMs,
+          errorDetails: 'AI response did not yield a valid editable timeline',
+        },
+      };
+    }
+    if (validation.sanitizedPlan.subtitles.length > 0) {
+      validation.sanitizedPlan.warnings.push('Phụ đề do AI tạo ra chưa được kiểm chứng với bản ghi âm. Hãy kiểm tra trước khi xuất.');
+    }
     const qualityCheck = await runQualityCheck(validation.sanitizedPlan, options.userPrompt);
 
     return {
