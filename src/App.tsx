@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   AppProcessStatus,
   AspectRatio,
@@ -64,6 +64,27 @@ export default function App() {
   const [renderResult, setRenderResult] = useState<RenderResult | null>(null);
   const activeRenderIdRef = useRef<string | null>(null);
   const cancelledRenderIdRef = useRef<string | null>(null);
+  const [renderProgress, setRenderProgress] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (status !== 'rendering') return;
+    const jobId = activeRenderIdRef.current;
+    if (!jobId) return;
+    let active = true;
+    const check = async () => {
+      try {
+        const response = await fetch('/api/render-progress/' + encodeURIComponent(jobId), { cache: 'no-store' });
+        if (!response.ok) return;
+        const data = await response.json();
+        if (active && data.success && typeof data.percent === 'number' && Number.isFinite(data.percent)) {
+          setRenderProgress(Math.max(0, Math.min(100, data.percent)));
+        }
+      } catch { /* The render request reports the authoritative outcome. */ }
+    };
+    void check();
+    const timer = setInterval(() => { void check(); }, 900);
+    return () => { active = false; clearInterval(timer); };
+  }, [status]);
 
   // 1. Upload Video File
   const handleFileUpload = async (file: File) => {
@@ -365,6 +386,7 @@ export default function App() {
     setErrorMessage('');
     setIsExportModalOpen(true);
     setRenderResult(null);
+    setRenderProgress(0);
     const jobId = 'render_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 14);
     activeRenderIdRef.current = jobId;
     cancelledRenderIdRef.current = null;
@@ -387,6 +409,7 @@ export default function App() {
 
       if (cancelledRenderIdRef.current === jobId) return;
       setRenderResult(data.result);
+      setRenderProgress(100);
       setStatus('completed');
       setStatusMessage('Quá trình dựng video MP4 đã hoàn tất thành công.');
     } catch (err: any) {
@@ -405,6 +428,7 @@ export default function App() {
     cancelledRenderIdRef.current = jobId;
     setStatus('idle');
     setStatusMessage('Đã gửi yêu cầu hủy dựng video.');
+    setRenderProgress(null);
     setIsExportModalOpen(false);
     try {
       await fetchApiJson('/api/cancel-render', {
@@ -637,6 +661,7 @@ export default function App() {
         isOpen={isExportModalOpen}
         isRendering={status === 'rendering'}
         renderResult={renderResult}
+        renderProgress={renderProgress}
         errorMessage={errorMessage}
         onClose={() => setIsExportModalOpen(false)}
         onCancelRender={handleCancelRender}
