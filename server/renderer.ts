@@ -137,13 +137,33 @@ export async function renderEditPlan(
 
       // Video trim
       const vLabel = `v_${i}`;
-      filterParts.push(`[0:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS[${vLabel}]`);
+      // Scale/crop each clip before concatenating to support real timeline zoom settings.
+      const requestedZoom = Number.isFinite(seg.zoom) ? seg.zoom! : 1;
+      const punchZoom = plan.effects?.zoomPunchIn && i % 2 === 1 ? 1.08 : 1;
+      const zoom = Math.min(1.35, Math.max(1, requestedZoom, punchZoom));
+      const scaleW = Math.ceil(targetW * zoom / 2) * 2;
+      const scaleH = Math.ceil(targetH * zoom / 2) * 2;
+      const fx = Math.max(0, Math.min(1, seg.focalPoint?.x ?? focalX));
+      const fy = Math.max(0, Math.min(1, seg.focalPoint?.y ?? focalY));
+      const dur = seg.sourceEnd - seg.sourceStart;
+      const fadeSec = Math.min(0.12, dur / 5);
+      const fadeIn = plan.effects?.transition === 'fade' && i > 0 ? `,fade=t=in:st=0:d=${fadeSec.toFixed(3)}` : '';
+      const fadeOut = plan.effects?.transition === 'fade' && i < keptSegments.length - 1
+        ? `,fade=t=out:st=${Math.max(0, dur - fadeSec).toFixed(3)}:d=${fadeSec.toFixed(3)}` : '';
+      const clipFilters = `[0:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS,` +
+        `scale=w=${scaleW}:h=${scaleH}:force_original_aspect_ratio=increase,` +
+        `crop=${targetW}:${targetH}:(iw-${targetW})*${fx}:(ih-${targetH})*${fy},setsar=1` +
+        `${fadeIn}${fadeOut}[${vLabel}]`;
+      filterParts.push(clipFilters);
       vConcatInputs.push(`[${vLabel}]`);
 
       // Audio trim
       if (hasAudio) {
         const aLabel = `a_${i}`;
-        filterParts.push(`[0:a]atrim=start=${start}:end=${end},asetpts=PTS-STARTPTS[${aLabel}]`);
+        const aFadeIn = plan.effects?.transition === 'fade' && i > 0 ? `,afade=t=in:st=0:d=${fadeSec.toFixed(3)}` : '';
+        const aFadeOut = plan.effects?.transition === 'fade' && i < keptSegments.length - 1
+          ? `,afade=t=out:st=${Math.max(0, dur - fadeSec).toFixed(3)}:d=${fadeSec.toFixed(3)}` : '';
+        filterParts.push(`[0:a]atrim=start=${start}:end=${end},asetpts=PTS-STARTPTS${aFadeIn}${aFadeOut}[${aLabel}]`);
         aConcatInputs.push(`[${aLabel}]`);
       }
     }
@@ -160,11 +180,10 @@ export async function renderEditPlan(
       filterParts.push(`${vConcatInputs.join('')}concat=n=${numSegs}:v=1:a=0[${currentV}]`);
     }
 
-    // Aspect ratio crop & scale filter
-    // Smart crop using focal point (scale to cover, then crop to targetW x targetH)
-    const scaleCropFilter = `scale=w=${targetW}:h=${targetH}:force_original_aspect_ratio=increase,crop=${targetW}:${targetH}:(iw-${targetW})*${focalX}:(ih-${targetH})*${focalY}`;
-    filterParts.push(`[${currentV}]${scaleCropFilter}[v_cropped]`);
-    currentV = 'v_cropped';
+    // Clip-level framing has already normalized every segment to the export size.
+    if (plan.effects?.transition === 'crossfade') {
+      warnings.push('Crossfade chưa được hỗ trợ; video dùng chuyển cảnh cắt trực tiếp.');
+    }
 
     // Color effects
     if (plan.effects?.colorFilter && plan.effects.colorFilter !== 'none') {
@@ -199,9 +218,11 @@ export async function renderEditPlan(
     if (hasAudio && plan.audio?.normalize) {
       filterParts.push(`[${currentA}]loudnorm=I=-16:TP=-1.5:LRA=11[a_norm]`);
       currentA = 'a_norm';
-    } else if (hasAudio && plan.audio?.volumeBoost && plan.audio.volumeBoost !== 1.0) {
-      filterParts.push(`[${currentA}]volume=${plan.audio.volumeBoost}[a_norm]`);
-      currentA = 'a_norm';
+    }
+    if (hasAudio && Number.isFinite(plan.audio?.volumeBoost) && plan.audio.volumeBoost !== 1) {
+      const boost = Math.max(0.5, Math.min(2, plan.audio.volumeBoost));
+      filterParts.push(`[${currentA}]volume=${boost}[a_boost]`);
+      currentA = 'a_boost';
     }
 
     const filterComplexStr = filterParts.join(';');
