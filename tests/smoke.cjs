@@ -4,28 +4,19 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { execFileSync } = require('node:child_process');
-const ts = require('typescript');
+// Register tsx to load the project's TypeScript modules directly.
+require('tsx/cjs');
 
 const root = path.resolve(__dirname, '..');
 const work = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-cut-smoke-'));
 const previous = process.cwd();
-const modules = ['server/config.ts', 'server/media.ts', 'server/renderer.ts', 'server/validator.ts'];
-for (const f of modules) {
-  const out = path.join(work, f.replace(/\.ts$/, '.js'));
-  fs.mkdirSync(path.dirname(out), { recursive:true });
-  const js = ts.transpileModule(fs.readFileSync(path.join(root,f),'utf8'), {
-    fileName:f, compilerOptions:{target:ts.ScriptTarget.ES2022, module:ts.ModuleKind.CommonJS, esModuleInterop:true}
-  }).outputText;
-  fs.writeFileSync(out,js);
-}
-fs.writeFileSync(path.join(work,'package.json'),'{"type":"commonjs"}');
 
 async function main() {
   process.chdir(work);
-  const { SERVER_CONFIG, ensureStorageDirectories } = require(path.join(work,'server/config.js'));
-  const { extractMediaMetadata } = require(path.join(work,'server/media.js'));
-  const { validateAndSanitizeEditPlan } = require(path.join(work,'server/validator.js'));
-  const { renderEditPlan, cancelRender, generateSrtContent } = require(path.join(work,'server/renderer.js'));
+  const { SERVER_CONFIG, ensureStorageDirectories } = require(path.join(root,'server/config.ts'));
+  const { extractMediaMetadata } = require(path.join(root,'server/media.ts'));
+  const { validateAndSanitizeEditPlan } = require(path.join(root,'server/validator.ts'));
+  const { renderEditPlan, cancelRender, generateSrtContent } = require(path.join(root,'server/renderer.ts'));
   await ensureStorageDirectories();
   const testSrt = generateSrtContent([
     {id:'s1',start:0.5,end:2.5,text:'Caption across a cut'}
