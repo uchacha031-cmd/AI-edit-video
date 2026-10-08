@@ -5,7 +5,7 @@ import fs from 'fs/promises';
 import fsSync from 'fs';
 import { createServer as createViteServer } from 'vite';
 import { SERVER_CONFIG, ensureStorageDirectories } from './server/config.js';
-import { extractMediaMetadata, detectSilence, extractThumbnails } from './server/media.js';
+import { extractMediaMetadata, detectSilence, detectSceneChanges, extractThumbnails } from './server/media.js';
 import { generateEditPlanWithGemini, modifyPlanWithNaturalLanguage, buildDeterministicPlan } from './server/gemini.js';
 import { renderEditPlan, cancelRender } from './server/renderer.js';
 import { getOrCreateSampleVideo } from './server/sampleVideo.js';
@@ -157,7 +157,7 @@ app.post('/api/upload', upload.single('video'), async (req: Request, res: Respon
     }
 
     // 2. Silence detection via ffmpeg
-    const silences = metadata.hasAudio ? await detectSilence(filePath) : [];
+    const silences = metadata.hasAudio ? await detectSilence(filePath, -30, 0.5, metadata.duration) : [];
 
     // 3. Thumbnails
     const thumbnails = await extractThumbnails(filePath, metadata.duration);
@@ -191,7 +191,7 @@ app.post('/api/sample', async (req: Request, res: Response) => {
     const filename = path.basename(filePath);
 
     const metadata = await extractMediaMetadata(filePath);
-    const silences = metadata.hasAudio ? await detectSilence(filePath) : [];
+    const silences = metadata.hasAudio ? await detectSilence(filePath, -30, 0.5, metadata.duration) : [];
     const thumbnails = await extractThumbnails(filePath, metadata.duration);
 
     res.json({
@@ -216,7 +216,7 @@ app.post('/api/offline-plan', async (req: Request, res: Response) => {
     const filePath = resolveSourceFile(req.body?.videoId);
     if (!filePath) return res.status(404).json({ success: false, error: 'Video nguồn không tồn tại' });
     const metadata = await extractMediaMetadata(filePath);
-    const silences = metadata.hasAudio ? await detectSilence(filePath) : [];
+    const silences = metadata.hasAudio ? await detectSilence(filePath, -30, 0.5, metadata.duration) : [];
     const preset = typeof req.body.preset === 'string' ? req.body.preset.slice(0, 60) : 'Clean Minimal';
     const duration = Math.min(metadata.duration, Math.max(1, Number(req.body.targetDuration) || 30));
     const plan = buildDeterministicPlan(metadata, silences, preset, duration);
@@ -244,13 +244,17 @@ app.post('/api/analyze', async (req: Request, res: Response) => {
     }
 
     const metadata = await extractMediaMetadata(filePath);
-    const silences = metadata.hasAudio ? await detectSilence(filePath) : [];
+    const silences = metadata.hasAudio ? await detectSilence(filePath, -30, 0.5, metadata.duration) : [];
+
+    const sceneEvidence = await detectSceneChanges(filePath, metadata.duration, 90);
 
     const result = await generateEditPlanWithGemini(filePath, metadata, silences, {
       preset: preset || 'Fast TikTok',
       targetDuration: Number(targetDuration) || 30,
       userPrompt,
       aspectRatio,
+      sceneCuts: sceneEvidence.timestamps,
+      sceneCoverageSeconds: sceneEvidence.analyzedSeconds,
     });
 
     if (!result.success) {
