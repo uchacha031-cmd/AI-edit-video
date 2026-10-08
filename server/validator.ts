@@ -57,10 +57,10 @@ export function validateAndSanitizeEditPlan(
 
   for (let i = 0; i < rawSegments.length; i++) {
     const s = rawSegments[i];
-    let start = Number(s.sourceStart);
-    let end = Number(s.sourceEnd);
+    let start = Number(s?.sourceStart);
+    let end = Number(s?.sourceEnd);
 
-    if (!Number.isFinite(start) || !Number.isFinite(end)) {
+    if (!s || typeof s !== 'object' || !Number.isFinite(start) || !Number.isFinite(end)) {
       warnings.push(`Phân đoạn #${i + 1} có mốc thời gian không hợp lệ; đã bỏ qua.`);
       continue;
     }
@@ -88,7 +88,7 @@ export function validateAndSanitizeEditPlan(
       : 'core';
     const reason = String(s.reason || 'Đoạn nội dung được chọn').slice(0, 300);
     const label = s.label ? String(s.label).slice(0, 100) : undefined;
-    const zoom = s.zoom && typeof s.zoom === 'number' ? Math.max(1.0, Math.min(1.35, s.zoom)) : 1.0;
+    const zoom = Number.isFinite(s.zoom) ? Math.max(1.0, Math.min(1.35, s.zoom)) : 1.0;
 
     let focalPoint = { x: 0.5, y: 0.5 };
     if (s.focalPoint && typeof s.focalPoint === 'object') {
@@ -166,9 +166,9 @@ export function validateAndSanitizeEditPlan(
 
   for (let i = 0; i < rawSubtitles.length; i++) {
     const sub = rawSubtitles[i];
-    let start = Number(sub.start);
-    let end = Number(sub.end);
-    const text = String(sub.text || '').trim();
+    let start = Number(sub?.start);
+    let end = Number(sub?.end);
+    const text = String(sub?.text || '').trim();
 
     if (!Number.isFinite(start) || !Number.isFinite(end) || !text) continue;
 
@@ -195,8 +195,8 @@ export function validateAndSanitizeEditPlan(
   const crop = {
     aspectRatio,
     focalPoint: {
-      x: typeof rawPlan.crop?.focalPoint?.x === 'number' ? Math.max(0, Math.min(1, rawPlan.crop.focalPoint.x)) : 0.5,
-      y: typeof rawPlan.crop?.focalPoint?.y === 'number' ? Math.max(0, Math.min(1, rawPlan.crop.focalPoint.y)) : 0.5,
+      x: Number.isFinite(rawPlan.crop?.focalPoint?.x) ? Math.max(0, Math.min(1, rawPlan.crop.focalPoint.x)) : 0.5,
+      y: Number.isFinite(rawPlan.crop?.focalPoint?.y) ? Math.max(0, Math.min(1, rawPlan.crop.focalPoint.y)) : 0.5,
     },
   };
 
@@ -213,10 +213,10 @@ export function validateAndSanitizeEditPlan(
   const audio = {
     normalize: rawPlan.audio?.normalize !== false,
     removeSilence: rawPlan.audio?.removeSilence !== false,
-    silenceThresholdDb: typeof rawPlan.audio?.silenceThresholdDb === 'number'
+    silenceThresholdDb: Number.isFinite(rawPlan.audio?.silenceThresholdDb)
       ? rawPlan.audio.silenceThresholdDb
       : -30,
-    volumeBoost: typeof rawPlan.audio?.volumeBoost === 'number'
+    volumeBoost: Number.isFinite(rawPlan.audio?.volumeBoost)
       ? Math.max(0.5, Math.min(2.0, rawPlan.audio.volumeBoost))
       : 1.0,
   };
