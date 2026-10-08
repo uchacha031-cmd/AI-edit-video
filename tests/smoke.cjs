@@ -73,6 +73,21 @@ async function main() {
   assert.equal((await extractMediaMetadata(path.join(SERVER_CONFIG.RENDER_DIR,withAudio.filename))).hasAudio,true);
   console.log('PASS FFmpeg preserves audio stream');
 
+  // Exercise the previously unimplemented visible editing effects.
+  const styled = structuredClone(validated.sanitizedPlan);
+  styled.segments[0].zoom = 1.25;
+  styled.effects.zoomPunchIn = true;
+  styled.effects.transition = 'fade';
+  styled.audio.normalize = true;
+  styled.audio.volumeBoost = 1.15;
+  const styledOutput = await renderEditPlan(audioFile, styled, 'render_styled_test_12345', { burnSubtitles: false });
+  assert.equal(styledOutput.success, true);
+  const styledMeta = await extractMediaMetadata(path.join(SERVER_CONFIG.RENDER_DIR, styledOutput.filename));
+  assert.equal(styledMeta.hasAudio, true);
+  assert.ok(Math.abs(styledMeta.duration - 1.8) < 0.3);
+  console.log('PASS FFmpeg zoom, fade transitions and boosted normalized audio');
+
+
   cancelRender('render_cancel_preflight_123');
   await assert.rejects(()=>renderEditPlan(srcFile,validated.sanitizedPlan,'render_cancel_preflight_123',{burnSubtitles:false}),/cancelled/);
   console.log('PASS render cancellation before FFmpeg begins');
@@ -81,6 +96,6 @@ async function main() {
   setTimeout(()=>cancelRender(inflightId), 35);
   await assert.rejects(()=>inflightRender,/cancelled/);
   console.log('PASS render cancellation while FFmpeg is running');
-  console.log('RESULT 8/8 PASS');
+  console.log('RESULT 9/9 PASS');
 }
 main().catch(e=>{console.error('FAIL',e); process.exitCode=1;}).finally(()=>{process.chdir(previous); fs.rmSync(work,{recursive:true,force:true});});
