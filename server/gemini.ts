@@ -8,6 +8,7 @@ import {
   AiDiagnostics,
 } from '../src/types/editor.js';
 import { validateAndSanitizeEditPlan } from './validator.js';
+import { buildConservativeEditTimeline } from './editing.js';
 
 // Helper for timeout
 function withTimeout<T>(promise: Promise<T>, ms: number, errorMsg: string): Promise<T> {
@@ -319,69 +320,41 @@ export function buildDeterministicPlan(
   const duration = meta.duration;
   const segments: any[] = [];
   
-  // Cut silence periods longer than 0.8s
-  const cutRanges = silences.filter((s) => s.duration >= 0.7);
-  let curStart = 0;
-  let segIndex = 1;
-
-  for (const s of cutRanges) {
-    if (s.start > curStart + 0.3) {
-      segments.push({
-        id: `seg_${segIndex++}`,
-        sourceStart: Number(curStart.toFixed(2)),
-        sourceEnd: Number(s.start.toFixed(2)),
-        keep: true,
-        confidence: 0.9,
-        reason: segIndex === 2 ? 'Đoạn mở đầu nổi bật (Hook)' : 'Nội dung chính giữa các khoảng dừng',
-        role: segIndex === 2 ? 'hook' : 'core',
-        zoom: 1.0,
-        focalPoint: { x: 0.5, y: 0.5 },
-      });
-    }
-
+  // Conservative non-AI editing: leave room around speech and smooth short cuts.
+  // Reference principle: Auto-Editor --margin and --smooth.
+  const timeline = buildConservativeEditTimeline(duration, silences);
+  let segIndex = 0;
+  const parts = [
+    ...timeline.kept.map(range => ({ ...range, keep: true })),
+    ...timeline.removed.map(range => ({ ...range, keep: false })),
+  ].sort((a, b) => a.start - b.start || a.end - b.end);
+  for (const part of parts) {
+    if (part.end <= part.start) continue;
+    const first = segIndex === 0;
+    const role = part.keep ? (first ? 'hook' : 'core') : 'silence';
     segments.push({
-      id: `seg_${segIndex++}`,
-      sourceStart: Number(s.start.toFixed(2)),
-      sourceEnd: Number(s.end.toFixed(2)),
-      keep: false,
-      confidence: 0.95,
-      reason: `Khoảng lặng tạm dừng ${s.duration.toFixed(1)}s (đã cắt)`,
-      role: 'silence',
-      zoom: 1.0,
-      focalPoint: { x: 0.5, y: 0.5 },
-    });
-
-    curStart = s.end;
-  }
-
-  if (curStart < duration - 0.3) {
-    segments.push({
-      id: `seg_${segIndex++}`,
-      sourceStart: Number(curStart.toFixed(2)),
-      sourceEnd: Number(duration.toFixed(2)),
-      keep: true,
-      confidence: 0.85,
-      reason: 'Đoạn kết luận và chào kết',
-      role: 'outro',
+      id: 'seg_' + (++segIndex),
+      sourceStart: part.start,
+      sourceEnd: part.end,
+      keep: part.keep,
+      confidence: part.keep ? 0.80 : 0.92,
+      reason: part.keep
+        ? 'Đoạn được giữ theo tín hiệu âm thanh, có khoảng đệm để tránh cắt mất lời nói'
+        : 'Khoảng lặng đã trừ biên an toàn đầu/cuối',
+      role,
       zoom: 1.0,
       focalPoint: { x: 0.5, y: 0.5 },
     });
   }
-
-  if (segments.length === 0) {
-    segments.push({
-      id: 'seg_1',
-      sourceStart: 0,
-      sourceEnd: Number(duration.toFixed(2)),
-      keep: true,
-      confidence: 1.0,
-      reason: 'Toàn bộ nội dung video gốc',
-      role: 'core',
-      zoom: 1.0,
-      focalPoint: { x: 0.5, y: 0.5 },
-    });
+  const estimatedKeptDuration = timeline.kept.reduce((sum, p) => sum + p.end - p.start, 0);
+  const planningWarnings = [...timeline.warnings];
+  if (estimatedKeptDuration > targetDuration + 1) {
+    planningWarnings.push(
+      'Bản dựng cơ bản dài khoảng ' + estimatedKeptDuration.toFixed(1) + 's, vượt mục tiêu ' + targetDuration.toFixed(1) + 's. ' +
+      'Không tự ý cắt bỏ lời nói; hãy dùng AI hoặc chọn thủ công để rút ngắn thêm.'
+    );
   }
-
+  planningWarnings.push('Chế độ cơ bản chỉ phân tích khoảng lặng, không nhận diện ý nghĩa, highlight hay phiên âm.');
   const rawPlan: any = {
     project: {
       title: `Bản dựng ${preset}`,
@@ -428,7 +401,7 @@ export function buildDeterministicPlan(
       targetDuration: Math.min(targetDuration, duration),
       actualEstimatedDuration: duration,
     },
-    warnings: [],
+    warnings: planningWarnings,
   };
 
   const validation = validateAndSanitizeEditPlan(rawPlan, meta);
